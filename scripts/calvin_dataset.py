@@ -28,6 +28,7 @@ class CALVINDataset(Dataset):
         self.chunk_size = chunk_size
         self.action_key = action_key
         self.image_key = image_key
+        self.sharded = any(self.dataset_dir.glob("ep_*"))
 
         ann = np.load(
             self.dataset_dir / "lang_annotations" / "auto_lang_ann.npy",
@@ -46,19 +47,25 @@ class CALVINDataset(Dataset):
 
         self.texts = texts
 
+    def _episode_path(self, frame_id: int) -> Path:
+        fname = f"episode_{frame_id:07d}.npz"
+        if self.sharded:
+            return self.dataset_dir / f"ep_{frame_id // 1000:04d}" / fname
+        return self.dataset_dir / fname
+
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         frame_id, ann_idx = self.samples[idx]
         image = Image.fromarray(
-            np.load(self.dataset_dir / f"episode_{frame_id:07d}.npz")[self.image_key]
+            np.load(self._episode_path(frame_id))[self.image_key]
         )
 
         # Load action chunk: actions from frame_id to frame_id + chunk_size - 1
         actions = []
         for offset in range(self.chunk_size):
-            ep = np.load(self.dataset_dir / f"episode_{frame_id + offset:07d}.npz")
+            ep = np.load(self._episode_path(frame_id + offset))
             actions.append(ep[self.action_key])
         action_chunk = torch.tensor(np.stack(actions), dtype=torch.float32)  # (chunk_size, 7)
 
