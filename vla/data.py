@@ -7,7 +7,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-ACTION_TOKEN = "<action>"
+from vla.config import ACTION_TOKEN
 
 
 class CALVINDataset(Dataset):

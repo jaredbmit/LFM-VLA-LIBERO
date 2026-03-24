@@ -4,7 +4,7 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-from calvin_dataset import CALVINDataset, make_calvin_collate_fn
+from vla.data import CALVINDataset, make_calvin_collate_fn
 
 CALVIN_BASE = "/home/jared/drl/calvin/dataset/calvin_debug_dataset"
 MODEL_ID = "LiquidAI/LFM2-VL-3B"

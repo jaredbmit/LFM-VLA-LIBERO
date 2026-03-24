@@ -1,7 +1,13 @@
 [project]
 name = "lfm-vla-libero"
 version = "0.1.0"
-description = "Add your description here"
+description = "VLA policy training and evaluation on CALVIN"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "torch",
+    "transformers",
+    "numpy",
+    "pillow",
+    "tqdm",
+]

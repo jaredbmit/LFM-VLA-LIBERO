@@ -1,4 +1,4 @@
-"""VLA: VLM + learnable action query token + MLP action head, trained with BC on CALVIN."""
+"""Train a VLA policy on CALVIN with behavioral cloning."""
 
 import csv
 import json
@@ -11,14 +11,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-from calvin_dataset import ACTION_TOKEN, CALVINDataset, make_calvin_collate_fn
+from vla import VLA, ACTION_TOKEN, CHUNK_SIZE, MAX_LENGTH, SYSTEM_PROMPT
+from vla.config import ACTION_DIM, HIDDEN_DIM
+from vla.data import CALVINDataset, make_calvin_collate_fn
 
 CALVIN_BASE = "/home/jared/drl/calvin/dataset/calvin_debug_dataset"
 MODEL_ID = "LiquidAI/LFM2-VL-3B"
-SYSTEM_PROMPT = (
-    "You are a robot manipulation agent. Given an image of the current scene "
-    "and a language instruction, predict the next action to execute."
-)
 
 BATCH_SIZE = 4
 NUM_STEPS = 10000
@@ -26,73 +24,32 @@ LOG_EVERY = 100
 EVAL_EVERY = 500
 SAVE_EVERY = 1000
 LR = 1e-5
-HIDDEN_DIM = 2048
-ACTION_DIM = 7
-CHUNK_SIZE = 10
-MAX_LENGTH = 256
 RUN_DIR = "runs"
-
-
-class VLA(nn.Module):
-    def __init__(self, vlm, action_token_id: int, hidden_dim=HIDDEN_DIM,
-                 action_dim=ACTION_DIM, chunk_size=CHUNK_SIZE):
-        super().__init__()
-        self.vlm = vlm
-        self.action_token_id = action_token_id
-        self.chunk_size = chunk_size
-        self.action_dim = action_dim
-
-        # VLM4VLA-style action head: hidden_dim -> 1024 -> 1024 -> chunk_size * action_dim
-        self.action_head = nn.Sequential(
-            nn.Linear(hidden_dim, 1024),
-            nn.ReLU(),
-            nn.Linear(1024, 1024),
-            nn.ReLU(),
-            nn.Linear(1024, chunk_size * action_dim),
-        )
-
-    def forward(self, **vlm_inputs):
-        outputs = self.vlm(**vlm_inputs, output_hidden_states=True)
-
-        last_hidden = outputs.hidden_states[-1]  # (B, seq_len, hidden_dim)
-
-        # Find <action> token position in each sequence
-        action_mask = vlm_inputs["input_ids"] == self.action_token_id  # (B, seq_len)
-        action_idx = action_mask.long().argmax(dim=1)  # (B,) — first occurrence
-        action_hidden = last_hidden[torch.arange(last_hidden.shape[0]), action_idx]  # (B, hidden_dim)
-
-        raw = self.action_head(action_hidden.float())  # (B, chunk_size * action_dim)
-        return raw.view(-1, self.chunk_size, self.action_dim)  # (B, chunk_size, 7)
 
 
 def save_checkpoint(run_dir: Path, tag: str, vla, optimizer, processor, step, val_loss):
     ckpt_dir = run_dir / "checkpoints" / tag
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save action head weights
     torch.save({
         "step": step,
         "val_loss": val_loss,
         "action_head": vla.action_head.state_dict(),
     }, ckpt_dir / "action_head.pt")
 
-    # Save full VLM (includes fine-tuned weights + resized embeddings)
     vla.vlm.save_pretrained(ckpt_dir / "vlm")
     processor.save_pretrained(ckpt_dir / "vlm")
 
-    # Save optimizer state for resuming
     torch.save(optimizer.state_dict(), ckpt_dir / "optimizer.pt")
 
     print(f"  Saved checkpoint: {ckpt_dir}")
 
 
 def main():
-    # Create run directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = Path(RUN_DIR) / timestamp
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save hyperparameters
     hparams = {
         "calvin_base": CALVIN_BASE, "model_id": MODEL_ID,
         "batch_size": BATCH_SIZE, "num_steps": NUM_STEPS, "lr": LR,
@@ -102,7 +59,6 @@ def main():
     with open(run_dir / "hparams.json", "w") as f:
         json.dump(hparams, f, indent=2)
 
-    # Set up CSV logger
     log_path = run_dir / "metrics.csv"
     log_file = open(log_path, "w", newline="")
     csv_writer = csv.writer(log_file)
@@ -112,8 +68,6 @@ def main():
     print("Loading processor...")
     processor = AutoProcessor.from_pretrained(MODEL_ID, max_image_tokens=256)
     processor.tokenizer.padding_side = "right"
-
-    # Add action query token to vocabulary
     processor.tokenizer.add_special_tokens({"additional_special_tokens": [ACTION_TOKEN]})
 
     print("Loading VLM...")
@@ -130,7 +84,6 @@ def main():
     total = sum(p.numel() for p in vla.parameters())
     print(f"Trainable: {trainable:,} / {total:,} params ({100 * trainable / total:.2f}%)")
 
-    # Data
     train_ds = CALVINDataset(f"{CALVIN_BASE}/training", chunk_size=CHUNK_SIZE)
     val_ds = CALVINDataset(f"{CALVIN_BASE}/validation", chunk_size=CHUNK_SIZE)
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
@@ -144,9 +97,8 @@ def main():
     bce_fn = nn.BCEWithLogitsLoss()
 
     def loss_fn(pred, gt):
-        # pred/gt: (B, chunk_size, 7)
         pose_loss = mse_fn(pred[:, :, :6], gt[:, :, :6])
-        gripper_target = (gt[:, :, 6] + 1) / 2  # -1 -> 0, +1 -> 1
+        gripper_target = (gt[:, :, 6] + 1) / 2
         gripper_loss = bce_fn(pred[:, :, 6], gripper_target)
         return pose_loss + gripper_loss
 
@@ -202,7 +154,6 @@ def main():
             csv_writer.writerow([step, "", f"{val_loss:.6f}", f"{elapsed:.1f}"])
             log_file.flush()
 
-            # Save best model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 save_checkpoint(run_dir, "best", vla, optimizer, processor, step, val_loss)
@@ -212,12 +163,11 @@ def main():
         if step % SAVE_EVERY == 0:
             save_checkpoint(run_dir, f"step_{step}", vla, optimizer, processor, step, best_val_loss)
 
-    # Save final checkpoint
     save_checkpoint(run_dir, "final", vla, optimizer, processor, NUM_STEPS, best_val_loss)
 
     log_file.close()
 
-    # --- Final check ---
+    # Final check
     vla.eval()
     batch = next(iter(val_loader))
     gt_actions = batch.pop("gt_actions").to(device)
