@@ -5,27 +5,29 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
+import argparse
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-from vla import VLA, ACTION_TOKEN, CHUNK_SIZE, MAX_LENGTH, SYSTEM_PROMPT
-from vla.config import ACTION_DIM, HIDDEN_DIM
+from vla import VLA, ACTION_TOKEN, CHUNK_SIZE, MAX_LENGTH, MODEL_REGISTRY, SYSTEM_PROMPT
+from vla.config import ACTION_DIM
 from vla.data import CALVINDataset, make_calvin_collate_fn
 
 # CALVIN_BASE = "/home/jared/drl/calvin/dataset/task_D_D_annotated"
 CALVIN_BASE = "/home/jared/drl/calvin/dataset/calvin_debug_dataset"
-MODEL_ID = "LiquidAI/LFM2-VL-1.6B"
 RUN_DIR = "/home/jared/lfm-vla/runs"
 
-BATCH_SIZE = 4
+BATCH_SIZE = 1
 NUM_STEPS = 1000
 LOG_EVERY = 100
 EVAL_EVERY = 500
 SAVE_EVERY = NUM_STEPS // 4
 LR = 1e-5
+WARMUP_STEPS = 100  # linear warmup before cosine decay
+GRAD_CLIP = 1.0
 
 
 def save_checkpoint(run_dir: Path, tag: str, vla, processor, step, val_loss):
@@ -49,11 +51,18 @@ def main():
     run_dir = Path(RUN_DIR) / timestamp
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    parser = argparse.ArgumentParser(description="Train a VLA policy on CALVIN")
+    parser.add_argument("--model", default="lfm2", choices=list(MODEL_REGISTRY),
+                        help="VLM backbone to use (default: lfm2)")
+    args = parser.parse_args()
+    spec = MODEL_REGISTRY[args.model]
+
     hparams = {
-        "calvin_base": CALVIN_BASE, "model_id": MODEL_ID,
+        "model": args.model, "model_id": spec.model_id,
+        "calvin_base": CALVIN_BASE,
         "batch_size": BATCH_SIZE, "num_steps": NUM_STEPS, "lr": LR,
-        "hidden_dim": HIDDEN_DIM, "action_dim": ACTION_DIM,
-        "chunk_size": CHUNK_SIZE, "max_length": MAX_LENGTH,
+        "warmup_steps": WARMUP_STEPS, "grad_clip": GRAD_CLIP,
+        "action_dim": ACTION_DIM, "chunk_size": CHUNK_SIZE, "max_length": MAX_LENGTH,
     }
     with open(run_dir / "hparams.json", "w") as f:
         json.dump(hparams, f, indent=2)
@@ -64,20 +73,22 @@ def main():
     csv_writer.writerow(["step", "train_loss", "val_loss", "elapsed_sec"])
 
     print(f"Run directory: {run_dir}")
+    print(f"Model: {spec.model_id}")
     print("Loading processor...")
-    processor = AutoProcessor.from_pretrained(MODEL_ID, max_image_tokens=256)
-    processor.tokenizer.padding_side = "right"
-    processor.tokenizer.add_special_tokens({"additional_special_tokens": [ACTION_TOKEN]})
+    processor = AutoProcessor.from_pretrained(spec.model_id, **spec.processor_kwargs)
+    tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    tok.padding_side = "right"
+    tok.add_special_tokens({"additional_special_tokens": [ACTION_TOKEN]})
 
     print("Loading VLM...")
     vlm = AutoModelForImageTextToText.from_pretrained(
-        MODEL_ID, device_map="auto", dtype=torch.bfloat16,
+        spec.model_id, device_map="auto", **spec.model_kwargs,
     )
-    vlm.resize_token_embeddings(len(processor.tokenizer))
+    vlm.resize_token_embeddings(len(tok))
 
     device = next(vlm.parameters()).device
-    action_token_id = processor.tokenizer.convert_tokens_to_ids(ACTION_TOKEN)
-    vla = VLA(vlm, action_token_id=action_token_id, chunk_size=CHUNK_SIZE).to(device)
+    action_token_id = tok.convert_tokens_to_ids(ACTION_TOKEN)
+    vla = VLA(vlm, action_token_id=action_token_id, hidden_dim=spec.hidden_dim, chunk_size=CHUNK_SIZE).to(device)
 
     trainable = sum(p.numel() for p in vla.parameters() if p.requires_grad)
     total = sum(p.numel() for p in vla.parameters())
@@ -86,17 +97,22 @@ def main():
     train_ds = CALVINDataset(f"{CALVIN_BASE}/training", chunk_size=CHUNK_SIZE)
     val_ds = CALVINDataset(f"{CALVIN_BASE}/validation", chunk_size=CHUNK_SIZE)
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
-    collate_fn = make_calvin_collate_fn(processor, SYSTEM_PROMPT, max_length=MAX_LENGTH)
+    collate_fn = make_calvin_collate_fn(processor, SYSTEM_PROMPT, max_length=MAX_LENGTH,
+                                        collate_style=spec.collate_style)
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
 
     optimizer = torch.optim.AdamW(vla.parameters(), lr=LR)
-    mse_fn = nn.MSELoss()
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=LR, total_steps=NUM_STEPS,
+        pct_start=WARMUP_STEPS / NUM_STEPS, anneal_strategy="cos",
+    )
+    huber_fn = nn.SmoothL1Loss()  # Huber loss: less sensitive to outlier actions than MSE
     bce_fn = nn.BCEWithLogitsLoss()
 
     def loss_fn(pred, gt):
-        pose_loss = mse_fn(pred[:, :, :6], gt[:, :, :6])
+        pose_loss = huber_fn(pred[:, :, :6], gt[:, :, :6])
         gripper_target = (gt[:, :, 6] + 1) / 2
         gripper_loss = bce_fn(pred[:, :, 6], gripper_target)
         return pose_loss + gripper_loss
@@ -125,14 +141,17 @@ def main():
 
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(vla.parameters(), GRAD_CLIP)
         optimizer.step()
+        scheduler.step()
 
         running_loss += loss.item()
 
         if step % LOG_EVERY == 0:
             avg_loss = running_loss / LOG_EVERY
             elapsed = time.time() - start_time
-            print(f"  step {step:5d}  train_loss={avg_loss:.6f}  [{elapsed:.0f}s]")
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"  step {step:5d}  train_loss={avg_loss:.6f}  lr={current_lr:.2e}  [{elapsed:.0f}s]")
             csv_writer.writerow([step, f"{avg_loss:.6f}", "", f"{elapsed:.1f}"])
             log_file.flush()
             running_loss = 0.0

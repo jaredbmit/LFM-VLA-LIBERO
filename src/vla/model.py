@@ -3,11 +3,11 @@
 import torch
 import torch.nn as nn
 
-from vla.config import ACTION_DIM, CHUNK_SIZE, HIDDEN_DIM
+from vla.config import ACTION_DIM, CHUNK_SIZE
 
 
 class VLA(nn.Module):
-    def __init__(self, vlm, action_token_id: int, hidden_dim=HIDDEN_DIM,
+    def __init__(self, vlm, action_token_id: int, hidden_dim: int,
                  action_dim=ACTION_DIM, chunk_size=CHUNK_SIZE):
         super().__init__()
         self.vlm = vlm

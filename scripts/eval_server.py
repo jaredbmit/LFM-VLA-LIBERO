@@ -19,22 +19,23 @@ import torch
 from PIL import Image
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-from vla import VLA, ACTION_TOKEN, CHUNK_SIZE, MAX_LENGTH, SYSTEM_PROMPT
-from vla.config import ACTION_DIM, HIDDEN_DIM
+from vla import VLA, ACTION_TOKEN, CHUNK_SIZE, MAX_LENGTH, MODEL_REGISTRY, SYSTEM_PROMPT
+from vla.config import ACTION_DIM
 
 
-def load_checkpoint(ckpt_dir: Path, device: str):
+def load_checkpoint(ckpt_dir: Path, device: str, spec):
     print(f"Loading processor from {ckpt_dir / 'vlm'}...")
-    processor = AutoProcessor.from_pretrained(ckpt_dir / "vlm", max_image_tokens=256)
-    processor.tokenizer.padding_side = "right"
+    processor = AutoProcessor.from_pretrained(ckpt_dir / "vlm")
+    tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    tok.padding_side = "right"
 
     print(f"Loading VLM from {ckpt_dir / 'vlm'}...")
     vlm = AutoModelForImageTextToText.from_pretrained(
-        ckpt_dir / "vlm", device_map=device, dtype=torch.bfloat16,
+        ckpt_dir / "vlm", device_map=device, torch_dtype=torch.bfloat16,
     )
 
-    action_token_id = processor.tokenizer.convert_tokens_to_ids(ACTION_TOKEN)
-    vla = VLA(vlm, action_token_id=action_token_id).to(device)
+    action_token_id = tok.convert_tokens_to_ids(ACTION_TOKEN)
+    vla = VLA(vlm, action_token_id=action_token_id, hidden_dim=spec.hidden_dim).to(device)
 
     ckpt = torch.load(ckpt_dir / "action_head.pt", map_location=device, weights_only=True)
     vla.action_head.load_state_dict(ckpt["action_head"])
@@ -44,19 +45,28 @@ def load_checkpoint(ckpt_dir: Path, device: str):
     return vla, processor
 
 
-def preprocess(image: Image.Image, instruction: str, processor, device: str):
+def preprocess(image: Image.Image, instruction: str, processor, collate_style: str, device: str):
     """Build VLM inputs from a single image + instruction, matching training collate."""
-    action_token_id = processor.tokenizer.convert_tokens_to_ids(ACTION_TOKEN)
+    tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    action_token_id = tok.convert_tokens_to_ids(ACTION_TOKEN)
 
+    if collate_style == "paligemma":
+        vlm_inputs = processor(
+            text=[f"<image>\n{instruction}\n{ACTION_TOKEN}"],
+            images=[image],
+            return_tensors="pt",
+            truncation=True,
+            max_length=MAX_LENGTH,
+        )
+        return {k: v.to(device) for k, v in vlm_inputs.items()}
+
+    # chat_template path (lfm2, qwen)
     conversation = [
         {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": instruction},
-            ],
-        },
+        {"role": "user", "content": [
+            {"type": "image", "image": image},
+            {"type": "text", "text": instruction},
+        ]},
     ]
 
     vlm_inputs = processor.apply_chat_template(
@@ -65,16 +75,15 @@ def preprocess(image: Image.Image, instruction: str, processor, device: str):
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
-        padding=True,
         truncation=True,
         max_length=MAX_LENGTH,
     )
 
-    # Append <action> token (same logic as collate in vla/data.py)
+    # Append <action> token before padding (same logic as collate in vla/data.py)
     ids = vlm_inputs["input_ids"]
     mask = vlm_inputs["attention_mask"]
     B, S = ids.shape
-    new_ids = torch.full((B, S + 1), processor.tokenizer.pad_token_id, dtype=ids.dtype)
+    new_ids = torch.full((B, S + 1), tok.pad_token_id, dtype=ids.dtype)
     new_mask = torch.zeros((B, S + 1), dtype=mask.dtype)
     for i in range(B):
         real_len = mask[i].sum().item()
@@ -103,12 +112,12 @@ def postprocess(pred_chunk: torch.Tensor) -> list[list[float]]:
     return actions
 
 
-def handle_request(data: dict, vla, processor, device: str) -> dict:
+def handle_request(data: dict, vla, processor, collate_style: str, device: str) -> dict:
     img_bytes = base64.b64decode(data["image"])
     image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     instruction = data["instruction"]
 
-    vlm_inputs = preprocess(image, instruction, processor, device)
+    vlm_inputs = preprocess(image, instruction, processor, collate_style, device)
 
     with torch.no_grad():
         pred = vla(**vlm_inputs)  # (1, chunk_size, 7)
@@ -130,7 +139,7 @@ def recv_line(conn: socket.socket, buf: bytearray) -> str | None:
     return line
 
 
-def serve(vla, processor, device: str, port: int):
+def serve(vla, processor, collate_style: str, device: str, port: int):
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("localhost", port))
@@ -153,7 +162,7 @@ def serve(vla, processor, device: str, port: int):
                     conn.close()
                     server.close()
                     return
-                response = handle_request(request, vla, processor, device)
+                response = handle_request(request, vla, processor, collate_style, device)
                 conn.sendall(json.dumps(response).encode() + b"\n")
         except Exception as e:
             print(f"Error handling request: {e}")
@@ -165,12 +174,15 @@ def serve(vla, processor, device: str, port: int):
 def main():
     parser = argparse.ArgumentParser(description="VLA inference server")
     parser.add_argument("--checkpoint", required=True, help="Path to checkpoint dir")
+    parser.add_argument("--model", default="lfm", choices=list(MODEL_REGISTRY),
+                        help="VLM backbone used during training (default: lfm2)")
     parser.add_argument("--port", type=int, default=5555)
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
 
-    vla, processor = load_checkpoint(Path(args.checkpoint), args.device)
-    serve(vla, processor, args.device, args.port)
+    spec = MODEL_REGISTRY[args.model]
+    vla, processor = load_checkpoint(Path(args.checkpoint), args.device, spec)
+    serve(vla, processor, spec.collate_style, args.device, args.port)
 
 
 if __name__ == "__main__":

@@ -77,31 +77,29 @@ class CALVINDataset(Dataset):
         }
 
 
-def make_calvin_collate_fn(processor, system_prompt: str, max_length: int = 256):
+def make_calvin_collate_fn(processor, system_prompt: str, max_length: int = 256,
+                           collate_style: str = "chat_template"):
     """Returns a collate function that formats CALVIN samples for a VLM.
 
-    Builds chat-template conversations (system + user with image + instruction),
-    tokenizes with add_generation_prompt=True, appends the <action> token,
-    and stacks ground-truth action chunks.
+    collate_style="chat_template": builds system+user conversations, tokenizes via
+        apply_chat_template, and appends the <action> token before padding.
+    collate_style="paligemma": uses the PaliGemma processor directly, appending
+        the <action> token to the instruction text.
     """
-    action_token_id = processor.tokenizer.convert_tokens_to_ids(ACTION_TOKEN)
+    tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    action_token_id = tok.convert_tokens_to_ids(ACTION_TOKEN)
 
-    def collate_fn(batch):
+    def collate_chat_template(batch):
         conversations = []
         action_chunks = []
-
         for sample in batch:
-            convo = [
+            conversations.append([
                 {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": sample["image"]},
-                        {"type": "text", "text": sample["instruction"]},
-                    ],
-                },
-            ]
-            conversations.append(convo)
+                {"role": "user", "content": [
+                    {"type": "image", "image": sample["image"]},
+                    {"type": "text", "text": sample["instruction"]},
+                ]},
+            ])
             action_chunks.append(sample["action_chunk"])
 
         vlm_inputs = processor.apply_chat_template(
@@ -115,11 +113,11 @@ def make_calvin_collate_fn(processor, system_prompt: str, max_length: int = 256)
             max_length=max_length,
         )
 
-        # Insert <action> token before padding in each sequence
+        # Insert <action> token at the end of each sequence's real content (before padding)
         ids = vlm_inputs["input_ids"]
         mask = vlm_inputs["attention_mask"]
         B, S = ids.shape
-        new_ids = torch.full((B, S + 1), processor.tokenizer.pad_token_id, dtype=ids.dtype)
+        new_ids = torch.full((B, S + 1), tok.pad_token_id, dtype=ids.dtype)
         new_mask = torch.zeros((B, S + 1), dtype=mask.dtype)
         for i in range(B):
             real_len = mask[i].sum().item()
@@ -129,8 +127,26 @@ def make_calvin_collate_fn(processor, system_prompt: str, max_length: int = 256)
             new_mask[i, :real_len + 1] = 1
         vlm_inputs["input_ids"] = new_ids
         vlm_inputs["attention_mask"] = new_mask
-
-        vlm_inputs["gt_actions"] = torch.stack(action_chunks)  # (B, chunk_size, 7)
+        vlm_inputs["gt_actions"] = torch.stack(action_chunks)
         return vlm_inputs
 
-    return collate_fn
+    def collate_paligemma(batch):
+        # PaliGemma uses processor(text, images) directly — no chat template.
+        # Append <action> token to the instruction text so it ends up in the prefix
+        # with bidirectional attention, attending to both image and language tokens.
+        texts = [f"<image>\n{s['instruction']}\n{ACTION_TOKEN}" for s in batch]
+        images = [s["image"] for s in batch]
+        action_chunks = [s["action_chunk"] for s in batch]
+
+        vlm_inputs = processor(
+            text=texts,
+            images=images,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+        )
+        vlm_inputs["gt_actions"] = torch.stack(action_chunks)
+        return vlm_inputs
+
+    return collate_chat_template if collate_style == "chat_template" else collate_paligemma
