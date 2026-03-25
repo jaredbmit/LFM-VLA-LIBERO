@@ -3,6 +3,7 @@
 import csv
 import json
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 import argparse
@@ -49,7 +50,8 @@ def save_checkpoint(run_dir: Path, tag: str, vla, processor, step, val_loss):
 
 def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(RUN_DIR) / timestamp
+    uid = uuid.uuid4().hex[:8]
+    run_dir = Path(RUN_DIR) / f"{timestamp}_{uid}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     parser = argparse.ArgumentParser(description="Train a VLA policy on CALVIN")
