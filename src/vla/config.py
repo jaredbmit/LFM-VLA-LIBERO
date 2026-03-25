@@ -42,7 +42,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
     ),
     "paligemma": ModelSpec(
         model_id="google/paligemma2-3b-mix-224",
-        hidden_dim=2048,
+        hidden_dim=2304,
         model_kwargs={"torch_dtype": torch.bfloat16},
         processor_kwargs={},
         collate_style="paligemma",

@@ -20,11 +20,12 @@ from vla.data import CALVINDataset, make_calvin_collate_fn
 CALVIN_BASE = "/home/jared/drl/calvin/dataset/calvin_debug_dataset"
 RUN_DIR = "/home/jared/lfm-vla/runs"
 
-BATCH_SIZE = 1
-NUM_STEPS = 1000
+BATCH_SIZE = 32
+NUM_STEPS = 20000
 LOG_EVERY = 100
-EVAL_EVERY = 500
-SAVE_EVERY = NUM_STEPS // 4
+EVAL_EVERY = 2000
+SAVE_EVERY = EVAL_EVERY
+MAX_VAL_BATCHES = 200
 LR = 1e-5
 WARMUP_STEPS = 100  # linear warmup before cosine decay
 GRAD_CLIP = 1.0
@@ -166,6 +167,8 @@ def main():
                     val_batch = {k: v.to(device) for k, v in val_batch.items()}
                     val_loss_sum += loss_fn(vla(**val_batch), gt).item()
                     val_steps += 1
+                    if val_steps >= MAX_VAL_BATCHES:
+                        break
             val_loss = val_loss_sum / val_steps
             elapsed = time.time() - start_time
             print(f"           val_loss={val_loss:.6f}")
