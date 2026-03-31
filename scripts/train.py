@@ -23,12 +23,12 @@ CALVIN_BASE = "/home/jared/drl/calvin/dataset/calvin_debug_dataset"
 RUN_DIR = "/home/jared/lfm-vla/runs"
 
 # HPPs
-BATCH_SIZE = 1
+BATCH_SIZE = 32
 GRAD_STEPS = 4  # gradient accumulation steps
 NUM_STEPS = 30000
 LOG_EVERY = 100
 EVAL_EVERY = 3000
-SAVE_EVERY = EVAL_EVERY
+SAVE_EVERY = 1e8  # unused
 MAX_VAL_BATCHES = 500
 LR = 1e-5
 WARMUP_STEPS = 1000  # linear warmup before cosine decay
@@ -111,8 +111,8 @@ def main():
             task_type="CAUSAL_LM",
         )
         vlm = get_peft_model(vlm, lora_cfg)
-    print("VLM trainable params: ")
-    vlm.print_trainable_parameters()
+        print("VLM trainable params: ")
+        vlm.print_trainable_parameters()
 
     device = next(vlm.parameters()).device
     action_token_id = tok.convert_tokens_to_ids(ACTION_TOKEN)
@@ -133,7 +133,8 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
 
-    optimizer = torch.optim.AdamW(vla.parameters(), lr=LR)
+    trainable_params = [p for p in vla.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=LR)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, max_lr=LR, total_steps=NUM_STEPS,
         pct_start=WARMUP_STEPS / NUM_STEPS, anneal_strategy="cos",
@@ -175,7 +176,7 @@ def main():
         if micro_step % GRAD_STEPS != 0:
             continue
 
-        torch.nn.utils.clip_grad_norm_(vla.parameters(), GRAD_CLIP)
+        torch.nn.utils.clip_grad_norm_(trainable_params, GRAD_CLIP)
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
