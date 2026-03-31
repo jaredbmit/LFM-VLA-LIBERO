@@ -62,7 +62,6 @@ class VLA(nn.Module):
 
     def forward(self, **vlm_inputs):
         outputs = self.vlm(**vlm_inputs, output_hidden_states=True)
-
         last_hidden = outputs.hidden_states[-1]  # (B, seq_len, hidden_dim)
 
         # Find <action> token position in each sequence

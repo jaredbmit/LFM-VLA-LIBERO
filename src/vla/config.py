@@ -23,7 +23,6 @@ class ModelSpec:
     hidden_dim: int
     model_kwargs: dict
     processor_kwargs: dict
-    lora_targets: str | tuple
     collate_style: str  # "chat_template" | "paligemma"
     max_length: int = MAX_LENGTH
 
@@ -32,82 +31,72 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
     "LFM2-VL-3B": ModelSpec(
         model_id="LiquidAI/LFM2-VL-3B",
         hidden_dim=2048,
-        model_kwargs={"torch_dtype": torch.bfloat16},
+        model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={},
-        lora_targets="all-linear",
         collate_style="chat_template",
     ),
     "LFM2-VL-1.6B": ModelSpec(
         model_id="LiquidAI/LFM2-VL-1.6B",
         hidden_dim=2048,
-        model_kwargs={"torch_dtype": torch.bfloat16},
+        model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={},
-        lora_targets="all-linear",
         collate_style="chat_template",
     ),
     "LFM2-VL-450M": ModelSpec(
         model_id="LiquidAI/LFM2-VL-450M",
         hidden_dim=1024,
-        model_kwargs={"torch_dtype": torch.bfloat16},
+        model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={},
-        lora_targets="all-linear",
         collate_style="chat_template",
     ),
     "Qwen2.5-VL-3B-Instruct": ModelSpec(
         model_id="Qwen/Qwen2.5-VL-3B-Instruct",
         hidden_dim=2048,
-        model_kwargs={"torch_dtype": torch.bfloat16},
+        model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={},
-        lora_targets="all-linear",
         collate_style="chat_template",
     ),
     "Qwen3-VL-2B-Instruct": ModelSpec(
         model_id="Qwen/Qwen3-VL-2B-Instruct",
         hidden_dim=2048,
-        model_kwargs={"torch_dtype": torch.bfloat16},
+        model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={},
-        lora_targets="all-linear",
         collate_style="chat_template",
     ),
     "Qwen3-VL-4B-Instruct": ModelSpec(
         model_id="Qwen/Qwen3-VL-4B-Instruct",
         hidden_dim=2560,
-        model_kwargs={"torch_dtype": torch.bfloat16},
+        model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={},
-        lora_targets="all-linear",
         collate_style="chat_template",
     ),
     "paligemma2-3b-mix-224": ModelSpec(
         model_id="google/paligemma2-3b-mix-224",
         hidden_dim=2304,
-        model_kwargs={"torch_dtype": torch.bfloat16},
+        model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={},
-        lora_targets="all-linear",
         collate_style="paligemma",
     ),
     # Base is 2B parameters
     "SmolVLM-Instruct": ModelSpec(
         model_id="HuggingFaceTB/SmolVLM-Instruct",
         hidden_dim=2048,
-        model_kwargs={"torch_dtype": torch.bfloat16},
+        model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={"size": {"longest_edge": 256}},
-        lora_targets="all-linear",
         collate_style="chat_template",
     ),
     "SmolVLM-500M-Instruct": ModelSpec(
         model_id="HuggingFaceTB/SmolVLM-500M-Instruct",
         hidden_dim=960,
-        model_kwargs={"torch_dtype": torch.bfloat16},
+        model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={"size": {"longest_edge": 256}},
-        lora_targets="all-linear",
         collate_style="chat_template",
     ),
     "SmolVLM-256M-Instruct": ModelSpec(
         model_id="HuggingFaceTB/SmolVLM-256M-Instruct",
         hidden_dim=576,
-        model_kwargs={"torch_dtype": torch.bfloat16},
+        model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={"size": {"longest_edge": 256}},
-        lora_targets="all-linear",
         collate_style="chat_template",
     ),
 }

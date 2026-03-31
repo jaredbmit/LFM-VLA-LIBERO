@@ -12,7 +12,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import AutoModelForImageTextToText, AutoProcessor
-from peft import LoraConfig, get_peft_model
 
 from vla import VLA, ACTION_TOKEN, CHUNK_SIZE, MODEL_REGISTRY, SYSTEM_PROMPT
 from vla.config import ACTION_DIM, GRIPPER_LOSS_WEIGHT, RGB_PAD
@@ -23,8 +22,8 @@ CALVIN_BASE = "/home/jared/drl/calvin/dataset/calvin_debug_dataset"
 RUN_DIR = "/home/jared/lfm-vla/runs"
 
 # HPPs
-BATCH_SIZE = 32
-GRAD_STEPS = 4  # gradient accumulation steps
+BATCH_SIZE = 8
+GRAD_STEPS = 1  # gradient accumulation steps
 NUM_STEPS = 30000
 LOG_EVERY = 100
 EVAL_EVERY = 3000
@@ -33,9 +32,6 @@ MAX_VAL_BATCHES = 500
 LR = 1e-5
 WARMUP_STEPS = 1000  # linear warmup before cosine decay
 GRAD_CLIP = 1.0
-LORA_R = 8
-LORA_ALPHA = 16
-LORA_DROPOUT = 0.05
 
 
 def save_checkpoint(run_dir: Path, tag: str, vla, processor, step, val_loss):
@@ -65,18 +61,14 @@ def main():
     parser = argparse.ArgumentParser(description="Train a VLA policy on CALVIN")
     parser.add_argument("--model", default="LFM2-VL-450M", choices=list(MODEL_REGISTRY),
                         help="VLM backbone to use (default: LFM2-VL-450M)")
-    parser.add_argument("--finetune", default="lora", choices=["full", "lora"],
-                        help="Finetuning mode: full or lora (default: lora)")
     args = parser.parse_args()
     spec = MODEL_REGISTRY[args.model]
-    use_lora = args.finetune == "lora"
 
     hparams = {
         "model": args.model, "model_id": spec.model_id,
         "calvin_base": CALVIN_BASE,
         "batch_size": BATCH_SIZE, "grad_steps": GRAD_STEPS, "num_steps": NUM_STEPS, "lr": LR,
         "warmup_steps": WARMUP_STEPS, "grad_clip": GRAD_CLIP,
-        "finetune": args.finetune,
         "action_dim": ACTION_DIM, "chunk_size": CHUNK_SIZE, "max_length": spec.max_length,
     }
     with open(run_dir / "hparams.json", "w") as f:
@@ -97,22 +89,9 @@ def main():
 
     print("Loading VLM...")
     vlm = AutoModelForImageTextToText.from_pretrained(
-        spec.model_id, device_map="auto", **spec.model_kwargs,
-    )
+        spec.model_id, **spec.model_kwargs,
+    ).to("cuda")
     vlm.resize_token_embeddings(len(tok))
-
-    if use_lora:
-        lora_cfg = LoraConfig(
-            r=LORA_R,
-            lora_alpha=LORA_ALPHA,
-            lora_dropout=LORA_DROPOUT,
-            bias="none",
-            target_modules=spec.lora_targets,
-            task_type="CAUSAL_LM",
-        )
-        vlm = get_peft_model(vlm, lora_cfg)
-        print("VLM trainable params: ")
-        vlm.print_trainable_parameters()
 
     device = next(vlm.parameters()).device
     action_token_id = tok.convert_tokens_to_ids(ACTION_TOKEN)
