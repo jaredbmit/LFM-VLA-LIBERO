@@ -9,7 +9,7 @@ set -euo pipefail
 DIR="${1:?Usage: bash shard_calvin_episodes.sh /path/to/split_dir}"
 
 # Pre-create all shard dirs
-seq -w 0000 0999 | xargs -I{} mkdir -p "$DIR/ep_{}"
+seq -w 0000 1999 | xargs -I{} mkdir -p "$DIR/ep_{}"
 
 # Move files in bulk, 1000 at a time
 find "$DIR" -maxdepth 1 -name 'episode_*.npz' -print0 | \

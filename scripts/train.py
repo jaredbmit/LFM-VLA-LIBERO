@@ -61,13 +61,17 @@ def main():
     parser = argparse.ArgumentParser(description="Train a VLA policy on CALVIN")
     parser.add_argument("--model", default="LFM2-VL-450M", choices=list(MODEL_REGISTRY),
                         help="VLM backbone to use (default: LFM2-VL-450M)")
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--grad_steps", type=int, default=GRAD_STEPS)
     args = parser.parse_args()
     spec = MODEL_REGISTRY[args.model]
+    batch_size = args.batch_size
+    grad_steps = args.grad_steps
 
     hparams = {
         "model": args.model, "model_id": spec.model_id,
         "calvin_base": CALVIN_BASE,
-        "batch_size": BATCH_SIZE, "grad_steps": GRAD_STEPS, "num_steps": NUM_STEPS, "lr": LR,
+        "batch_size": batch_size, "grad_steps": grad_steps, "num_steps": NUM_STEPS, "lr": LR,
         "warmup_steps": WARMUP_STEPS, "grad_clip": GRAD_CLIP,
         "action_dim": ACTION_DIM, "chunk_size": CHUNK_SIZE, "max_length": spec.max_length,
     }
@@ -109,8 +113,8 @@ def main():
     collate_fn = make_calvin_collate_fn(processor, SYSTEM_PROMPT, max_length=spec.max_length,
                                         collate_style=spec.collate_style)
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
     trainable_params = [p for p in vla.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=LR)
@@ -128,7 +132,7 @@ def main():
         return pose_loss + GRIPPER_LOSS_WEIGHT * gripper_loss
 
     print(f"\nTraining: {len(train_ds)} samples, {len(val_ds)} val, "
-          f"{NUM_STEPS} steps, grad_steps={GRAD_STEPS}, chunk_size={CHUNK_SIZE}\n")
+          f"{NUM_STEPS} steps, grad_steps={grad_steps}, chunk_size={CHUNK_SIZE}\n")
 
     vla.train()
     optimizer.zero_grad()
@@ -138,7 +142,7 @@ def main():
     best_val_loss = float("inf")
     start_time = time.time()
 
-    for micro_step in range(1, NUM_STEPS * GRAD_STEPS + 1):
+    for micro_step in range(1, NUM_STEPS * grad_steps + 1):
         try:
             batch = next(train_iter)
         except StopIteration:
@@ -149,10 +153,10 @@ def main():
         batch = {k: v.to(device) for k, v in batch.items()}
 
         loss = loss_fn(vla(**batch), gt_actions)
-        (loss / GRAD_STEPS).backward()
+        (loss / grad_steps).backward()
         running_loss += loss.item()
 
-        if micro_step % GRAD_STEPS != 0:
+        if micro_step % grad_steps != 0:
             continue
 
         torch.nn.utils.clip_grad_norm_(trainable_params, GRAD_CLIP)
@@ -161,7 +165,7 @@ def main():
         optimizer.zero_grad()
 
         if update_step % LOG_EVERY == 0:
-            avg_loss = running_loss / (LOG_EVERY * GRAD_STEPS)
+            avg_loss = running_loss / (LOG_EVERY * grad_steps)
             elapsed = time.time() - start_time
             gpu_mib = torch.cuda.max_memory_allocated(device) // (1024 * 1024)
             torch.cuda.reset_peak_memory_stats(device)
