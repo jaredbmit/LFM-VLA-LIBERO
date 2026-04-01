@@ -2,16 +2,24 @@
 
 Run in the LFM-VLA venv. Communicates with eval_client.py via JSON-over-TCP.
 
+Supports batched inference: N worker clients connect simultaneously, the server
+collects their requests into a single batch, runs one forward pass, and returns
+results to each client. Set --num_workers to match the client's --num_workers.
+
 Usage:
     uv run python scripts/eval_server.py \
-        --checkpoint runs/<timestamp>/checkpoints/best
+        --checkpoint runs/<timestamp>/checkpoints/best \
+        --num_workers 4
 """
 
 import argparse
 import base64
 import io
 import json
+import queue
 import socket
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -20,7 +28,8 @@ from PIL import Image
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 from vla import VLA, ACTION_TOKEN, CHUNK_SIZE, MODEL_REGISTRY, SYSTEM_PROMPT
-from vla.config import ACTION_DIM, IMAGE_SIZE
+from vla.config import ACTION_DIM
+from vla.data import make_calvin_collate_fn
 
 
 def load_checkpoint(ckpt_dir: Path, device: str, spec):
@@ -47,67 +56,6 @@ def load_checkpoint(ckpt_dir: Path, device: str, spec):
     return vla, processor
 
 
-def preprocess(image: Image.Image, instruction: str, processor, collate_style: str, device: str, max_length: int = 512):
-    """Build VLM inputs from a single image + instruction, matching training collate."""
-    tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-    action_token_id = tok.convert_tokens_to_ids(ACTION_TOKEN)
-
-    if collate_style == "paligemma":
-        vlm_inputs = processor(
-            text=[f"<image>\n{instruction}\n{ACTION_TOKEN}"],
-            images=[image],
-            return_tensors="pt",
-            truncation=True,
-            max_length=max_length,
-        )
-        return {k: v.to(device) for k, v in vlm_inputs.items()}
-
-    # chat_template path (lfm2, qwen)
-    conversation = [
-        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
-        {"role": "user", "content": [
-            {"type": "image", "image": image},
-            {"type": "text", "text": instruction},
-        ]},
-    ]
-
-    vlm_inputs = processor.apply_chat_template(
-        [conversation],
-        add_generation_prompt=True,
-        tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
-        truncation=True,
-        max_length=max_length,
-    )
-
-    # Append <action> token before padding (same logic as collate in vla/data.py)
-    ids = vlm_inputs["input_ids"]
-    mask = vlm_inputs["attention_mask"]
-    B, S = ids.shape
-    new_ids = torch.full((B, S + 1), tok.pad_token_id, dtype=ids.dtype)
-    new_mask = torch.zeros((B, S + 1), dtype=mask.dtype)
-    seq_keys = [k for k, v in vlm_inputs.items()
-                if isinstance(v, torch.Tensor) and v.shape == (B, S)
-                and k not in ("input_ids", "attention_mask")]
-    new_seq = {k: torch.zeros((B, S + 1), dtype=vlm_inputs[k].dtype) for k in seq_keys}
-    for i in range(B):
-        real_len = mask[i].sum().item()
-        new_ids[i, :real_len] = ids[i, :real_len]
-        new_ids[i, real_len] = action_token_id
-        new_ids[i, real_len + 1:] = ids[i, real_len:]
-        new_mask[i, :real_len + 1] = 1
-        for k in seq_keys:
-            new_seq[k][i, :real_len] = vlm_inputs[k][i, :real_len]
-            new_seq[k][i, real_len + 1:] = vlm_inputs[k][i, real_len:]
-    vlm_inputs["input_ids"] = new_ids
-    vlm_inputs["attention_mask"] = new_mask
-    for k in seq_keys:
-        vlm_inputs[k] = new_seq[k]
-
-    return {k: v.to(device) for k, v in vlm_inputs.items()}
-
-
 def postprocess(pred_chunk: torch.Tensor) -> list[list[float]]:
     """Convert raw model output to CALVIN-compatible actions.
 
@@ -123,23 +71,83 @@ def postprocess(pred_chunk: torch.Tensor) -> list[list[float]]:
     return actions
 
 
-def handle_request(data: dict, vla, processor, collate_style: str, device: str, max_length: int = 512) -> dict:
-    img_bytes = base64.b64decode(data["image"])
-    image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    image = image.resize((IMAGE_SIZE, IMAGE_SIZE), Image.BICUBIC)
-    instruction = data["instruction"]
+class BatchInferenceEngine:
+    """Collects requests from concurrent worker threads and runs batched inference.
 
-    vlm_inputs = preprocess(image, instruction, processor, collate_style, device, max_length=max_length)
+    Each worker calls submit() which blocks until the batch is processed.
+    The inference loop fires when max_batch_size requests are queued or
+    batch_timeout_s seconds have elapsed since the first request arrived.
+    """
 
-    with torch.no_grad():
-        pred = vla(**vlm_inputs)  # (1, chunk_size, 7)
+    def __init__(self, vla, collate_fn, device: str, max_batch_size: int,
+                 batch_timeout_s: float = 0.05):
+        self.vla = vla
+        self.collate_fn = collate_fn
+        self.device = device
+        self.max_batch_size = max_batch_size
+        self.batch_timeout_s = batch_timeout_s
+        self._queue: queue.Queue = queue.Queue()
 
-    actions = postprocess(pred[0])
-    return {"actions": actions}
+    def submit(self, image: Image.Image, instruction: str) -> list[list[float]]:
+        """Submit a single request; block until the batch result is ready."""
+        event = threading.Event()
+        result: list = [None]
+        self._queue.put((image, instruction, event, result))
+        event.wait()
+        return result[0]
+
+    def run(self):
+        """Inference loop — run in a dedicated thread."""
+        while True:
+            # Block until at least one request arrives
+            try:
+                first = self._queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            pending = [first]
+            deadline = time.monotonic() + self.batch_timeout_s
+
+            # Collect more requests up to max_batch_size or timeout
+            while len(pending) < self.max_batch_size:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    pending.append(self._queue.get(timeout=remaining))
+                except queue.Empty:
+                    break
+
+            try:
+                # Build batch
+                dummy_chunk = torch.zeros(CHUNK_SIZE, ACTION_DIM)
+                samples = [
+                    {"image": img, "instruction": instr, "action_chunk": dummy_chunk}
+                    for img, instr, _, _ in pending
+                ]
+                vlm_inputs = self.collate_fn(samples)
+                vlm_inputs.pop("gt_actions")
+                vlm_inputs = {k: v.to(self.device) for k, v in vlm_inputs.items()}
+
+                with torch.inference_mode():
+                    preds = self.vla(**vlm_inputs)  # (B, chunk_size, 7)
+
+                # Return results to each waiting thread
+                for i, (_, _, event, result) in enumerate(pending):
+                    result[0] = postprocess(preds[i])
+                    event.set()
+
+            except Exception as e:
+                import traceback
+                print(f"Inference error (batch={len(pending)}): {e}", flush=True)
+                traceback.print_exc()
+                # Unblock waiting workers so they don't hang forever
+                for _, _, event, result in pending:
+                    result[0] = None
+                    event.set()
 
 
 def recv_line(conn: socket.socket, buf: bytearray) -> str | None:
-    """Read one newline-delimited JSON message from the socket."""
     while b"\n" not in buf:
         chunk = conn.recv(65536)
         if not chunk:
@@ -151,36 +159,58 @@ def recv_line(conn: socket.socket, buf: bytearray) -> str | None:
     return line
 
 
-def serve(vla, processor, collate_style: str, device: str, port: int, max_length: int = 512):
+def handle_connection(conn: socket.socket, engine: BatchInferenceEngine,
+                      shutdown_event: threading.Event):
+    buf = bytearray()
+    try:
+        while not shutdown_event.is_set():
+            line = recv_line(conn, buf)
+            if line is None:
+                break
+            request = json.loads(line)
+            if request.get("shutdown"):
+                shutdown_event.set()
+                conn.sendall(json.dumps({"status": "shutdown"}).encode() + b"\n")
+                break
+            image = Image.open(io.BytesIO(base64.b64decode(request["image"]))).convert("RGB")
+            actions = engine.submit(image, request["instruction"])
+            conn.sendall(json.dumps({"actions": actions}).encode() + b"\n")
+    except Exception as e:
+        print(f"Connection error: {e}")
+    finally:
+        conn.close()
+        print("Client disconnected.")
+
+
+def serve(vla, collate_fn, device: str, port: int, num_workers: int):
+    engine = BatchInferenceEngine(vla, collate_fn, device, max_batch_size=num_workers)
+    inference_thread = threading.Thread(target=engine.run, daemon=True)
+    inference_thread.start()
+
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("localhost", port))
-    server.listen(1)
-    print(f"VLA inference server listening on localhost:{port}")
+    server.listen(num_workers)
+    server.settimeout(1.0)
+    print(f"VLA inference server listening on localhost:{port} (max_batch={num_workers})")
 
-    while True:
-        conn, addr = server.accept()
-        print(f"Client connected from {addr}")
-        buf = bytearray()
-        try:
-            while True:
-                line = recv_line(conn, buf)
-                if line is None:
-                    break
-                request = json.loads(line)
-                if request.get("shutdown"):
-                    print("Shutdown requested.")
-                    conn.sendall(json.dumps({"status": "shutdown"}).encode() + b"\n")
-                    conn.close()
-                    server.close()
-                    return
-                response = handle_request(request, vla, processor, collate_style, device, max_length=max_length)
-                conn.sendall(json.dumps(response).encode() + b"\n")
-        except Exception as e:
-            print(f"Error handling request: {e}")
-        finally:
-            conn.close()
-            print("Client disconnected.")
+    shutdown_event = threading.Event()
+    threads = []
+    try:
+        while not shutdown_event.is_set():
+            try:
+                conn, addr = server.accept()
+            except socket.timeout:
+                continue
+            print(f"Client connected from {addr}")
+            t = threading.Thread(target=handle_connection,
+                                 args=(conn, engine, shutdown_event), daemon=True)
+            t.start()
+            threads.append(t)
+    finally:
+        server.close()
+        for t in threads:
+            t.join(timeout=2.0)
 
 
 def main():
@@ -190,11 +220,16 @@ def main():
                         help="VLM backbone used during training (default: lfm2)")
     parser.add_argument("--port", type=int, default=5555)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--num_workers", type=int, default=1,
+                        help="Number of parallel eval worker clients (sets max batch size)")
     args = parser.parse_args()
 
     spec = MODEL_REGISTRY[args.model]
     vla, processor = load_checkpoint(Path(args.checkpoint), args.device, spec)
-    serve(vla, processor, spec.collate_style, args.device, args.port, max_length=spec.max_length)
+    collate_fn = make_calvin_collate_fn(processor, SYSTEM_PROMPT,
+                                        max_length=spec.max_length,
+                                        collate_style=spec.collate_style)
+    serve(vla, collate_fn, args.device, args.port, args.num_workers)
 
 
 if __name__ == "__main__":

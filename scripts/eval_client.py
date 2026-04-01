@@ -2,11 +2,16 @@
 
 Run in the calvin_venv conda env. Connects to eval_server.py over TCP.
 
+With --num_workers > 1, spawns N independent processes each running their own
+CALVIN env. All workers connect to the same server, which batches their requests
+for efficient GPU utilization.
+
 Usage:
     conda activate calvin_venv
     python scripts/eval_client.py \
         --dataset_path ~/drl/calvin/dataset/task_D_D \
-        --num_sequences 1000
+        --num_sequences 1000 \
+        --num_workers 4
 """
 from __future__ import annotations
 
@@ -14,6 +19,7 @@ import argparse
 import base64
 import io
 import json
+import multiprocessing as mp
 import os
 import socket
 import time
@@ -52,7 +58,7 @@ class InferenceClient:
             try:
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.sock.connect((self.host, self.port))
-                print(f"Connected to inference server at {self.host}:{self.port}")
+                print(f"Worker {os.getpid()}: connected to inference server at {self.host}:{self.port}")
                 return
             except ConnectionRefusedError:
                 self.sock.close()
@@ -73,27 +79,21 @@ class InferenceClient:
         self.close()
 
     def reset(self):
-        """Clear action buffer at the start of each subtask."""
         self.action_queue = []
 
     def step(self, obs, instruction: str) -> np.ndarray:
-        """Get the next action, querying the server when the buffer is empty."""
         if not self.action_queue:
-            image_rgb = obs["rgb_obs"]["rgb_static"]  # (200, 200, 3) uint8
+            image_rgb = obs["rgb_obs"]["rgb_static"]
             actions = self._query(image_rgb, instruction)
             self.action_queue = actions
-
         return np.array(self.action_queue.pop(0))
 
     def _query(self, image_rgb: np.ndarray, instruction: str) -> list[list[float]]:
         buf = io.BytesIO()
-        Image.fromarray(image_rgb).save(buf, format="JPEG", quality=95)
+        Image.fromarray(image_rgb).save(buf, format="JPEG", quality=85)
         image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-
-        request = {"image": image_b64, "instruction": instruction}
-        self._send(request)
-        response = self._recv()
-        return response["actions"]
+        self._send({"image": image_b64, "instruction": instruction})
+        return self._recv()["actions"]
 
     def _send(self, data: dict):
         self.sock.sendall(json.dumps(data).encode() + b"\n")
@@ -116,7 +116,6 @@ def make_env(dataset_path):
 
 
 def _annotate_frame(frame: np.ndarray, label: str) -> np.ndarray:
-    """Upscale frame 2x and burn a text label into the bottom strip."""
     img = Image.fromarray(frame).resize((frame.shape[1] * 2, frame.shape[0] * 2), Image.NEAREST)
     draw = ImageDraw.Draw(img)
     try:
@@ -222,23 +221,23 @@ def print_and_save(results, sequences, log_dir, num_sequences):
     return data
 
 
-def main():
-    seed_everything(0, workers=True)
+def _worker_main(worker_id: int, sequences: list, args_dict: dict, result_queue: mp.Queue):
+    """Entry point for each worker process."""
+    try:
+        _worker_main_inner(worker_id, sequences, args_dict, result_queue)
+    except Exception as e:
+        import traceback
+        print(f"Worker {worker_id} crashed: {e}", flush=True)
+        traceback.print_exc()
+        result_queue.put((worker_id, None, None))  # signal done
 
-    parser = argparse.ArgumentParser(description="CALVIN evaluation client")
-    parser.add_argument("--dataset_path", required=True, help="Path to CALVIN dataset (e.g. task_D_D)")
-    parser.add_argument("--host", default="localhost")
-    parser.add_argument("--port", type=int, default=5555)
-    parser.add_argument("--num_sequences", type=int, default=1000)
-    parser.add_argument("--eval_log_dir", default=None)
-    parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--num_videos", type=int, default=0,
-                        help="Save MP4 videos for the first N sequences (0 = disabled)")
-    parser.add_argument("--video_dir", default=None,
-                        help="Directory to save videos (default: eval_log_dir/videos or ./eval_videos)")
-    args = parser.parse_args()
 
-    # Load CALVIN task oracle and annotations
+def _worker_main_inner(worker_id: int, sequences: list, args_dict: dict, result_queue: mp.Queue):
+    seed_everything(worker_id, workers=True)
+
+    args = argparse.Namespace(**args_dict)
+
+    calvin_conf_dir = None
     for candidate in [
         Path.home() / "drl/calvin/calvin_models/conf",
         Path("/home/jared/drl/calvin/calvin_models/conf"),
@@ -246,62 +245,153 @@ def main():
         if (candidate / "callbacks/rollout/tasks/new_playtable_tasks.yaml").exists():
             calvin_conf_dir = candidate
             break
-    else:
+    if calvin_conf_dir is None:
         raise FileNotFoundError("Could not find CALVIN conf directory")
 
     task_cfg = OmegaConf.load(calvin_conf_dir / "callbacks/rollout/tasks/new_playtable_tasks.yaml")
     task_oracle = hydra.utils.instantiate(task_cfg)
     val_annotations = OmegaConf.load(calvin_conf_dir / "annotations/new_playtable_validation.yaml")
 
-    print(f"Creating CALVIN environment from {args.dataset_path}...")
     env = make_env(args.dataset_path)
-
-    print(f"Generating {args.num_sequences} evaluation sequences...")
-    eval_sequences = get_sequences(args.num_sequences)
-
     client = InferenceClient(args.host, args.port)
     client.connect()
 
-    video_dir = None
-    if args.num_videos > 0:
-        video_dir = Path(args.video_dir) if args.video_dir else (
-            Path(args.eval_log_dir) / "videos" if args.eval_log_dir else Path("eval_videos")
+    for seq_idx, (initial_state, eval_sequence) in enumerate(sequences):
+        result = evaluate_sequence(
+            env, client, task_oracle, initial_state, eval_sequence,
+            val_annotations, args.debug,
         )
-        print(f"Saving first {args.num_videos} sequence videos to {video_dir}/")
+        result_queue.put((worker_id, seq_idx, result))
 
-    results = []
-    seq_iter = eval_sequences
-    if not args.debug:
-        seq_iter = tqdm(eval_sequences, position=0, leave=True)
+    client.close()
+    result_queue.put((worker_id, None, None))  # sentinel: worker done
 
-    start_time = time.time()
 
-    try:
-        for seq_idx, (initial_state, eval_sequence) in enumerate(seq_iter):
-            frames = [] if (video_dir is not None and seq_idx < args.num_videos) else None
-            result = evaluate_sequence(
-                env, client, task_oracle, initial_state, eval_sequence, val_annotations, args.debug,
-                frames=frames,
+def main():
+    seed_everything(0, workers=True)
+
+    parser = argparse.ArgumentParser(description="CALVIN evaluation client")
+    parser.add_argument("--dataset_path", required=True)
+    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--port", type=int, default=5555)
+    parser.add_argument("--num_sequences", type=int, default=1000)
+    parser.add_argument("--num_workers", type=int, default=1,
+                        help="Number of parallel env worker processes (default: 1)")
+    parser.add_argument("--eval_log_dir", default=None)
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--num_videos", type=int, default=0)
+    parser.add_argument("--video_dir", default=None)
+    args = parser.parse_args()
+
+    eval_sequences = get_sequences(args.num_sequences)
+
+    if args.num_workers == 1:
+        # Single-process path — unchanged behavior
+        calvin_conf_dir = None
+        for candidate in [
+            Path.home() / "drl/calvin/calvin_models/conf",
+            Path("/home/jared/drl/calvin/calvin_models/conf"),
+        ]:
+            if (candidate / "callbacks/rollout/tasks/new_playtable_tasks.yaml").exists():
+                calvin_conf_dir = candidate
+                break
+        if calvin_conf_dir is None:
+            raise FileNotFoundError("Could not find CALVIN conf directory")
+
+        task_cfg = OmegaConf.load(calvin_conf_dir / "callbacks/rollout/tasks/new_playtable_tasks.yaml")
+        task_oracle = hydra.utils.instantiate(task_cfg)
+        val_annotations = OmegaConf.load(calvin_conf_dir / "annotations/new_playtable_validation.yaml")
+
+        print(f"Creating CALVIN environment from {args.dataset_path}...")
+        env = make_env(args.dataset_path)
+
+        client = InferenceClient(args.host, args.port)
+        client.connect()
+
+        video_dir = None
+        if args.num_videos > 0:
+            video_dir = Path(args.video_dir) if args.video_dir else (
+                Path(args.eval_log_dir) / "videos" if args.eval_log_dir else Path("eval_videos")
             )
-            results.append(result)
-            if frames:
-                tasks_str = "_".join(eval_sequence[:result + 1] if result < len(eval_sequence) else eval_sequence)
-                fname = f"seq{seq_idx:03d}_{result}of{len(eval_sequence)}_{tasks_str[:60]}.mp4"
-                save_video(frames, video_dir / fname)
-            if not args.debug:
-                seq_iter.set_description(
-                    " ".join([f"{i+1}/5: {v*100:.1f}% |" for i, v in enumerate(count_success(results))])
+
+        results = []
+        seq_iter = eval_sequences if args.debug else tqdm(eval_sequences)
+        start_time = time.time()
+        try:
+            for seq_idx, (initial_state, eval_sequence) in enumerate(seq_iter):
+                frames = [] if (video_dir and seq_idx < args.num_videos) else None
+                result = evaluate_sequence(
+                    env, client, task_oracle, initial_state, eval_sequence,
+                    val_annotations, args.debug, frames=frames,
                 )
-    except KeyboardInterrupt:
-        print(f"\nInterrupted after {len(results)} sequences.")
-    finally:
+                results.append(result)
+                if frames:
+                    tasks_str = "_".join(eval_sequence[:result + 1] if result < len(eval_sequence) else eval_sequence)
+                    save_video(frames, video_dir / f"seq{seq_idx:03d}_{result}of{len(eval_sequence)}_{tasks_str[:60]}.mp4")
+                if not args.debug:
+                    seq_iter.set_description(
+                        " ".join([f"{i+1}/5: {v*100:.1f}% |" for i, v in enumerate(count_success(results))])
+                    )
+        except KeyboardInterrupt:
+            print(f"\nInterrupted after {len(results)} sequences.")
+        finally:
+            elapsed = time.time() - start_time
+            print(f"\nEvaluation took {elapsed:.0f}s ({elapsed/3600:.1f}h)")
+            if results:
+                print_and_save(results, eval_sequences[:len(results)], args.eval_log_dir, len(results))
+            client.close()
+
+    else:
+        # Multi-process path: split sequences across workers
+        n = args.num_workers
+        shards = [eval_sequences[i::n] for i in range(n)]
+        print(f"Launching {n} worker processes ({len(eval_sequences)} sequences split ~{len(eval_sequences)//n} each)")
+
+        args_dict = vars(args)
+        result_queue: mp.Queue = mp.Queue()
+        processes = []
+        start_time = time.time()
+
+        for worker_id, shard in enumerate(shards):
+            p = mp.Process(target=_worker_main,
+                           args=(worker_id, shard, args_dict, result_queue),
+                           daemon=True)
+            p.start()
+            processes.append(p)
+
+        # Collect per-sequence results with progress bar
+        results = [None] * len(eval_sequences)
+        completed = []
+        workers_done = 0
+        pbar = tqdm(total=len(eval_sequences), disable=args.debug)
+        try:
+            while workers_done < n:
+                worker_id, seq_idx, result = result_queue.get(timeout=7200)
+                if seq_idx is None:
+                    # Sentinel: worker finished
+                    workers_done += 1
+                    continue
+                global_idx = worker_id + seq_idx * n
+                results[global_idx] = result
+                completed.append(result)
+                pbar.update(1)
+                pbar.set_description(
+                    " ".join([f"{i+1}/5: {v*100:.1f}% |"
+                              for i, v in enumerate(count_success(completed))])
+                )
+        except Exception as e:
+            print(f"Error collecting results: {e}")
+        finally:
+            pbar.close()
+            for p in processes:
+                p.join(timeout=5.0)
+
+        results = [r for r in results if r is not None]
+
         elapsed = time.time() - start_time
         print(f"\nEvaluation took {elapsed:.0f}s ({elapsed/3600:.1f}h)")
-
         if results:
             print_and_save(results, eval_sequences[:len(results)], args.eval_log_dir, len(results))
-
-        client.close()
 
 
 if __name__ == "__main__":
