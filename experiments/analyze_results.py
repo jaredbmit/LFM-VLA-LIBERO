@@ -1,13 +1,14 @@
 """
-Analyze and report results from VLA training experiments (runs/v3).
+Analyze and report results from VLA training experiments.
 
 Usage:
-    python experiments/analyze_results.py [--runs-dir runs/v3] [--out-dir experiments/results]
+    python experiments/analyze_results.py [--runs-dir runs/v4] [--out-dir experiments/results]
 
 Outputs:
-    - experiments/results/loss_curves.png   (train + val loss per model)
-    - experiments/results/calvin_results.png (chain SR bar chart per checkpoint)
-    - printed tables: training times, CALVIN D->D chain SR, avg seq len
+    - experiments/results/loss_curves.png        (train + val loss per model)
+    - experiments/results/loss_curves_animated.gif
+    - experiments/results/calvin_results.png     (chain SR bar chart for eval_best / eval_final)
+    - printed tables: training times, CALVIN ABC->D chain SR
 """
 
 import argparse
@@ -24,49 +25,46 @@ import pandas as pd
 
 # ── model display config ──────────────────────────────────────────────────────
 
-MODEL_LABELS = {
-    "paligemma": "PaliGemma2-3B",
-    "lfm":       "LFM2-VL-3B",
-    "qwen":      "Qwen2.5-VL-3B",
-}
-
 MODEL_COLORS = {
-    "paligemma2-3b-mix-224":  "#963AD3",
-    "LFM2-VL-450M":           "#77BDD3",
-    "LFM2-VL-1.6B":           "#4A7AC2",
-    "LFM2-VL-3B":             "#3844B8",
-    "Qwen3-VL-2B-Instruct":   "#6BAC7A",
-    "Qwen3-VL-4B-Instruct":   "#1C810F",
-    "SmolVLM-256M-Instruct":  "#CFA061",
-    "SmolVLM-500M-Instruct":  "#DA8540",
-    "SmolVLM-Instruct":       "#E06F12",
+    "LFM2-VL-450M":            "#77BDD3",
+    "LFM2-VL-1.6B":            "#4A7AC2",
+    "LFM2-VL-3B":              "#3844B8",
+    "Qwen3-VL-2B-Instruct":    "#6BAC7A",
+    "Qwen2.5-VL-3B-Instruct":  "#3A9E50",
+    "Qwen3-VL-4B-Instruct":    "#1C810F",
+    "SmolVLM-256M-Instruct":   "#CFA061",
+    "SmolVLM-500M-Instruct":   "#DA8540",
+    "SmolVLM-Instruct":        "#E06F12",
+    "paligemma2-3b-mix-224":   "#963AD3",
 }
 
-# eval dirs may be named eval_XXXX or log_step_XXXX
-EVAL_DIR_PATTERNS = ["eval_{step}", "log_step_{step}"]
+# Canonical display order: LFM (small→large), Qwen (small→large), SmolVLM (small→large), other
+MODEL_ORDER = [
+    "LFM2-VL-450M",
+    "LFM2-VL-1.6B",
+    "LFM2-VL-3B",
+    "Qwen3-VL-2B-Instruct",
+    "Qwen2.5-VL-3B-Instruct",
+    "Qwen3-VL-4B-Instruct",
+    "SmolVLM-256M-Instruct",
+    "SmolVLM-500M-Instruct",
+    "SmolVLM-Instruct",
+    "paligemma2-3b-mix-224",
+]
 
+
+def sort_models(models: list[str]) -> list[str]:
+    """Sort model names by MODEL_ORDER; unknowns appended alphabetically."""
+    known = [m for m in MODEL_ORDER if m in models]
+    unknown = sorted(m for m in models if m not in MODEL_ORDER)
+    return known + unknown
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def find_eval_dirs(model_dir: Path) -> dict[int, Path]:
-    """Return {step: path} for all eval result dirs found under model_dir."""
-    results = {}
-    for d in sorted(model_dir.iterdir()):
-        if not d.is_dir():
-            continue
-        results_file = d / "results.json"
-        if not results_file.exists():
-            continue
-        # parse step from dirname: eval_2000 or log_step_2000
-        name = d.name
-        for suffix in ("eval_", "log_step_"):
-            if name.startswith(suffix):
-                try:
-                    step = int(name[len(suffix):])
-                    results[step] = d
-                except ValueError:
-                    pass
-    return results
+def find_eval_dir(model_dir: Path, name: str) -> Path | None:
+    """Return the named eval directory under model_dir if results.json exists."""
+    p = model_dir / name
+    return p if (p / "results.json").exists() else None
 
 
 def load_metrics(model_dir: Path) -> pd.DataFrame | None:
@@ -106,7 +104,8 @@ def report_training_times(models_data: dict):
     print("TRAINING TIME STATISTICS")
     print("=" * 60)
     rows = []
-    for model, data in models_data.items():
+    for model in sort_models(list(models_data)):
+        data = models_data[model]
         df = data.get("metrics")
         if df is None:
             rows.append((model, "N/A", "N/A", "N/A", "N/A"))
@@ -144,53 +143,49 @@ def report_training_times(models_data: dict):
 
 # ── CALVIN results table ──────────────────────────────────────────────────────
 
-def report_calvin_results(models_data: dict):
-    print("\n" + "=" * 60)
-    print("CALVIN D->D CHAIN SUCCESS RATE (% completed N tasks in a row)")
-    print("=" * 60)
-
-    all_checkpoints = sorted({
-        step
-        for data in models_data.values()
-        for step in data.get("evals", {}).keys()
-    })
-
+def _print_calvin_table(models_data: dict, eval_key: str, label: str):
     col_w = 10
-    header_parts = [f"{'Model':<20}", f"{'Step':>8}"]
+    no_data_label = f"(no {eval_key})"
+    header_parts = [f"{'Model':<30}"]
     for k in range(1, 6):
         header_parts.append(f"{'SR-' + str(k):>{col_w}}")
     header_parts.append(f"{'Avg SR':>{col_w}}")
     header_parts.append(f"{'Avg SeqLen':>{col_w}}")
     header = " ".join(header_parts)
+
+    print("\n" + "=" * 60)
+    print(f"CALVIN ABC->D CHAIN SUCCESS RATE — {label}")
+    print("=" * 60)
     print(header)
     print("-" * len(header))
 
-    for model, data in models_data.items():
-        label = model
-        evals = data.get("evals", {})
-        if not evals:
-            print(f"{label:<20} {'(no evals)':>8}")
+    for model in sort_models(list(models_data)):
+        result = models_data[model].get(eval_key)
+        if result is None:
+            print(f"{model:<30} {no_data_label:>{col_w}}")
             continue
-        first = True
-        for step in sorted(evals.keys()):
-            result = evals[step]
-            chain_sr = result.get("chain_sr", {})
-            avg_sl = result.get("avg_seq_len", float("nan"))
-            sr_vals = [chain_sr.get(str(k), float("nan")) for k in range(1, 6)]
-            avg_sr = avg_chain_sr(chain_sr)
-            name_col = label if first else ""
-            first = False
-            row = f"{name_col:<20} {step:>8}"
-            for v in sr_vals:
-                row += f" {v * 100:>{col_w}.1f}"
-            row += f" {avg_sr * 100:>{col_w}.1f}"
-            row += f" {avg_sl:>{col_w}.2f}"
-            print(row)
-        print()
+        chain_sr = result.get("chain_sr", {})
+        avg_sl = result.get("avg_seq_len", float("nan"))
+        sr_vals = [chain_sr.get(str(k), float("nan")) for k in range(1, 6)]
+        avg_sr = avg_chain_sr(chain_sr)
+        row = f"{model:<30}"
+        for v in sr_vals:
+            row += f" {v * 100:>{col_w}.1f}"
+        row += f" {avg_sr * 100:>{col_w}.1f}"
+        row += f" {avg_sl:>{col_w}.2f}"
+        print(row)
 
-    print("SR-k = fraction of 1000-chain rollouts that completed >= k tasks consecutively.")
+    print("\nSR-k = fraction of 1000-chain rollouts completing >= k tasks consecutively.")
     print("Avg SR = mean of SR-1 through SR-5.")
-    print("Avg SeqLen = average consecutive tasks completed per rollout.")
+
+
+def report_calvin_results(models_data: dict):
+    has_best  = any(d.get("best_eval")  is not None for d in models_data.values())
+    has_final = any(d.get("final_eval") is not None for d in models_data.values())
+    if has_best:
+        _print_calvin_table(models_data, "best_eval",  "best checkpoint")
+    if has_final:
+        _print_calvin_table(models_data, "final_eval", "final checkpoint")
 
 
 # ── plots ─────────────────────────────────────────────────────────────────────
@@ -199,12 +194,13 @@ def plot_loss_curves(models_data: dict, out_dir: Path):
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
     ax_train, ax_val = axes
 
-    for model, data in models_data.items():
+    for model in sort_models(list(models_data)):
+        data = models_data[model]
         df = data.get("metrics")
         if df is None:
             continue
         label = model
-        color = MODEL_COLORS[model]
+        color = MODEL_COLORS.get(model)
 
         train_df = df[df["train_loss"].notna()].copy()
         val_df   = df[df["val_loss"].notna()].copy()
@@ -290,7 +286,7 @@ def animate_loss_curves(models_data: dict, out_dir: Path, fps: int = 30,
 
     train_lines = {}
     val_lines = {}
-    all_models = sorted(set(train_curves) | set(val_curves))
+    all_models = sort_models(list(set(train_curves) | set(val_curves)))
     for model in all_models:
         color = MODEL_COLORS.get(model, None)
         if model in train_curves:
@@ -331,86 +327,52 @@ def animate_loss_curves(models_data: dict, out_dir: Path, fps: int = 30,
     print(f"Saved: {out_path}")
 
 
-def plot_calvin_results(models_data: dict, out_dir: Path):
-    all_checkpoints = sorted({
-        step
-        for data in models_data.values()
-        for step in data.get("evals", {}).keys()
-    })
-    models = list(models_data.keys())
-    n_models = len(models)
-    n_checks = len(all_checkpoints)
-
-    if n_checks == 0:
-        print("No eval data to plot.")
-        return
-
-    fig, axes = plt.subplots(1, n_checks, figsize=(5 * n_checks, 5), sharey=True)
-    if n_checks == 1:
-        axes = [axes]
-
+def _plot_calvin_ax(ax, models_data: dict, eval_key: str, title: str):
+    """Populate a single axes with chain SR bars for the given eval_key."""
+    models = sort_models([m for m, d in models_data.items() if d.get(eval_key) is not None])
     ks = [1, 2, 3, 4, 5]
     x = np.arange(len(ks))
-    bar_width = 0.8 / n_models
+    n_models = len(models)
+    bar_width = 0.8 / n_models if n_models else 0.8
 
-    for ax, step in zip(axes, all_checkpoints):
-        for i, model in enumerate(models):
-            evals = models_data[model].get("evals", {})
-            result = evals.get(step)
-            if result is None:
-                continue
-            chain_sr = result.get("chain_sr", {})
-            sr_vals = [chain_sr.get(str(k), 0.0) * 100 for k in ks]
-            offset = (i - n_models / 2 + 0.5) * bar_width
-            bars = ax.bar(x + offset, sr_vals, bar_width * 0.9,
-                          label=model, color=MODEL_COLORS[model], alpha=0.85)
+    for i, model in enumerate(models):
+        result = models_data[model][eval_key]
+        chain_sr = result.get("chain_sr", {})
+        sr_vals = [chain_sr.get(str(k), 0.0) * 100 for k in ks]
+        offset = (i - n_models / 2 + 0.5) * bar_width
+        ax.bar(x + offset, sr_vals, bar_width * 0.9,
+               label=model, color=MODEL_COLORS.get(model, None), alpha=0.85)
 
-        ax.set_title(f"Step {step:,}", fontsize=11)
-        ax.set_xticks(x)
-        ax.set_xticklabels([f"SR-{k}" for k in ks])
-        ax.set_ylim(0, 100)
-        ax.set_ylabel("Success Rate (%)")
-        ax.grid(axis="y", alpha=0.3)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"SR-{k}" for k in ks])
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("Success Rate (%)")
+    ax.set_title(title, fontsize=11, fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.grid(axis="y", alpha=0.3)
 
-    # single legend
-    handles, labels = axes[0].get_legend_handles_labels()
-    if handles:
-        fig.legend(handles, labels, loc="upper right", fontsize=10)
 
-    fig.suptitle("CALVIN D→D Chain Success Rate by Checkpoint", fontsize=13, fontweight="bold")
+def plot_calvin_results(models_data: dict, out_dir: Path):
+    """Bar chart of chain SR — best and/or final checkpoint, side by side when both exist."""
+    has_best  = any(d.get("best_eval")  is not None for d in models_data.values())
+    has_final = any(d.get("final_eval") is not None for d in models_data.values())
+
+    if not has_best and not has_final:
+        print("No eval_best or eval_final data to plot.")
+        return
+
+    panels = []
+    if has_best:
+        panels.append(("best_eval",  "CALVIN ABC→D Chain SR (best checkpoint)"))
+    if has_final:
+        panels.append(("final_eval", "CALVIN ABC→D Chain SR (final checkpoint)"))
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(8 * len(panels), 5), squeeze=False)
+    for ax, (eval_key, title) in zip(axes[0], panels):
+        _plot_calvin_ax(ax, models_data, eval_key, title)
+
     fig.tight_layout()
     out_path = out_dir / "calvin_results.png"
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved: {out_path}")
-
-
-def plot_sr1_over_steps(models_data: dict, out_dir: Path):
-    """Line plot of SR-1 (and optionally other SRs) vs training step per model."""
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-
-    for model, data in models_data.items():
-        evals = data.get("evals", {})
-        if not evals:
-            continue
-        steps = sorted(evals.keys())
-        sr1 = [evals[s].get("chain_sr", {}).get("1", float("nan")) * 100 for s in steps]
-        avg_sr = [avg_chain_sr(evals[s].get("chain_sr", {})) * 100 for s in steps]
-        color = MODEL_COLORS[model]
-        label = model
-        ax.plot(steps, sr1, "o-", color=color, linewidth=2, markersize=7, label=f"{label} (SR-1)")
-        ax.plot(steps, avg_sr, "s--", color=color, linewidth=1.2, markersize=5,
-                alpha=0.6, label=f"{label} (avg SR)")
-
-    ax.set_xlabel("Training Step")
-    ax.set_ylabel("Success Rate (%)")
-    ax.set_title("CALVIN D→D SR-1 and Avg SR vs Training Step")
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-    ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
-    ax.set_ylim(0, 100)
-    fig.tight_layout()
-    out_path = out_dir / "sr_over_steps.png"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out_path}")
@@ -420,8 +382,8 @@ def plot_sr1_over_steps(models_data: dict, out_dir: Path):
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze VLA experiment results.")
-    parser.add_argument("--runs-dir", default="runs/v3",
-                        help="Path to runs directory (default: runs/v3)")
+    parser.add_argument("--runs-dir", default="runs/v4",
+                        help="Path to runs directory (default: runs/v4)")
     parser.add_argument("--out-dir", default="experiments/results",
                         help="Directory to save plots (default: experiments/results)")
     args = parser.parse_args()
@@ -451,27 +413,34 @@ def main():
 
     models_data = {}
     for model, mdirs in runs_by_model.items():
-        merged_evals: dict = {}
+        best_eval = None
+        final_eval = None
         merged_metrics = None
         merged_hparams: dict = {}
         for mdir in mdirs:
-            eval_dirs = find_eval_dirs(mdir)
-            for step, edir in eval_dirs.items():
-                result = load_eval(edir)
-                if result is not None:
-                    merged_evals[step] = result
+            if best_eval is None:
+                edir = find_eval_dir(mdir, "eval_best")
+                if edir is not None:
+                    best_eval = load_eval(edir)
+            if final_eval is None:
+                edir = find_eval_dir(mdir, "eval_final")
+                if edir is not None:
+                    final_eval = load_eval(edir)
             if merged_metrics is None:
                 merged_metrics = load_metrics(mdir)
             if not merged_hparams:
                 merged_hparams = load_hparams(mdir)
 
         models_data[model] = {
-            "metrics":  merged_metrics,
-            "evals":    merged_evals,
-            "hparams":  merged_hparams,
+            "metrics":    merged_metrics,
+            "best_eval":  best_eval,
+            "final_eval": final_eval,
+            "hparams":    merged_hparams,
         }
         has_metrics = merged_metrics is not None
-        print(f"  {model}: metrics={'yes' if has_metrics else 'no'}, evals={sorted(merged_evals.keys())}")
+        print(f"  {model}: metrics={'yes' if has_metrics else 'no'}, "
+              f"eval_best={'yes' if best_eval else 'no'}, "
+              f"eval_final={'yes' if final_eval else 'no'}")
 
     # ── print tables ──
     report_training_times(models_data)
@@ -481,12 +450,8 @@ def main():
     plot_loss_curves(models_data, out_dir)
     animate_loss_curves(models_data, out_dir)
     plot_calvin_results(models_data, out_dir)
-    plot_sr1_over_steps(models_data, out_dir)
 
     print(f"\nAll outputs saved to: {out_dir}/")
-    print("\nInference time note:")
-    print("  To benchmark inference, run eval_client.py with --time-inference flag")
-    print("  (or add timing around model.generate() calls) and report ms/action-chunk.")
 
 
 if __name__ == "__main__":

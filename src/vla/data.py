@@ -8,7 +8,24 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from vla.config import ACTION_TOKEN, RGB_PAD, INSTRUCTION_PREPROMPT
+from vla.config import ACTION_TOKEN, RGB_PAD, INSTRUCTION_PREPROMPT, NORM_MIN, NORM_MAX
+
+
+def normalize_action(action: np.ndarray, norm_min: float = NORM_MIN,
+                      norm_max: float = NORM_MAX) -> np.ndarray:
+    """Clip pose dims to [norm_min, norm_max] and rescale to [-1, 1]. Gripper untouched."""
+    out = action.copy()
+    out[..., :6] = np.clip(out[..., :6], norm_min, norm_max)
+    out[..., :6] = 2 * (out[..., :6] - norm_min) / (norm_max - norm_min) - 1
+    return out
+
+
+def unnormalize_action(action: np.ndarray, norm_min: float = NORM_MIN,
+                       norm_max: float = NORM_MAX) -> np.ndarray:
+    """Reverse normalize_action for pose dims. Gripper untouched."""
+    out = action.copy()
+    out[..., :6] = 0.5 * (out[..., :6] + 1) * (norm_max - norm_min) + norm_min
+    return out
 
 
 def random_shift(image: Image.Image, pad: int) -> Image.Image:
@@ -35,12 +52,18 @@ class CALVINDataset(Dataset):
         action_key: str = "rel_actions",
         image_key: str = "rgb_static",
         rgb_pad: int = 0,
+        norm_action: bool = False,
+        norm_min: float = NORM_MIN,
+        norm_max: float = NORM_MAX,
     ):
         self.dataset_dir = Path(dataset_dir)
         self.chunk_size = chunk_size
         self.action_key = action_key
         self.image_key = image_key
         self.rgb_pad = rgb_pad
+        self.norm_action = norm_action
+        self.norm_min = norm_min
+        self.norm_max = norm_max
         self.sharded = any(self.dataset_dir.glob("ep_*"))
 
         ann = np.load(
@@ -82,7 +105,10 @@ class CALVINDataset(Dataset):
         for offset in range(self.chunk_size):
             ep = np.load(self._episode_path(frame_id + offset))
             actions.append(ep[self.action_key])
-        action_chunk = torch.tensor(np.stack(actions), dtype=torch.float32)  # (chunk_size, 7)
+        action_chunk = np.stack(actions)  # (chunk_size, 7)
+        if self.norm_action:
+            action_chunk = normalize_action(action_chunk, self.norm_min, self.norm_max)
+        action_chunk = torch.tensor(action_chunk, dtype=torch.float32)
 
         return {
             "image": image,

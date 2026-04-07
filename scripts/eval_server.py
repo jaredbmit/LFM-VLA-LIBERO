@@ -29,7 +29,7 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 
 from vla import VLA, ACTION_TOKEN, CHUNK_SIZE, MODEL_REGISTRY, SYSTEM_PROMPT
 from vla.config import ACTION_DIM
-from vla.data import make_calvin_collate_fn
+from vla.data import make_calvin_collate_fn, unnormalize_action
 
 
 def load_checkpoint(ckpt_dir: Path, device: str, spec):
@@ -52,18 +52,34 @@ def load_checkpoint(ckpt_dir: Path, device: str, spec):
     vla.gripper_head.load_state_dict(ckpt["gripper_head"])
     vla.eval()
 
+    # Load hparams to recover normalization settings
+    hparams_path = ckpt_dir.parent.parent / "hparams.json"
+    hparams = {}
+    if hparams_path.exists():
+        with open(hparams_path) as f:
+            hparams = json.load(f)
+
     print(f"Loaded checkpoint from step {ckpt['step']}, val_loss={ckpt['val_loss']:.6f}")
-    return vla, processor
+    if hparams.get("norm_action"):
+        print(f"  norm_action=True, norm_min={hparams['norm_min']}, norm_max={hparams['norm_max']}")
+    return vla, processor, hparams
 
 
-def postprocess(pred_chunk: torch.Tensor) -> list[list[float]]:
+def postprocess(pred_chunk: torch.Tensor,
+                norm_action: bool = False,
+                norm_min: float = -0.65,
+                norm_max: float = 0.65) -> list[list[float]]:
     """Convert raw model output to CALVIN-compatible actions.
 
     pred_chunk: (chunk_size, 7) — dims 0-5 are pose deltas, dim 6 is gripper logit.
+    If norm_action is True, pose dims are unnormalized from [-1,1] back to
+    [norm_min, norm_max] before being sent to the environment.
     """
     actions = []
     for t in range(pred_chunk.shape[0]):
         a = pred_chunk[t].cpu().numpy().copy()
+        if norm_action:
+            a = unnormalize_action(a, norm_min, norm_max)
         a[:6] = np.clip(a[:6], -1.0, 1.0)
         gripper_prob = 1.0 / (1.0 + np.exp(-float(a[6])))
         a[6] = 1.0 if gripper_prob > 0.5 else -1.0
@@ -80,12 +96,17 @@ class BatchInferenceEngine:
     """
 
     def __init__(self, vla, collate_fn, device: str, max_batch_size: int,
-                 batch_timeout_s: float = 0.05):
+                 batch_timeout_s: float = 0.05,
+                 norm_action: bool = False,
+                 norm_min: float = -0.65, norm_max: float = 0.65):
         self.vla = vla
         self.collate_fn = collate_fn
         self.device = device
         self.max_batch_size = max_batch_size
         self.batch_timeout_s = batch_timeout_s
+        self.norm_action = norm_action
+        self.norm_min = norm_min
+        self.norm_max = norm_max
         self._queue: queue.Queue = queue.Queue()
 
     def submit(self, image: Image.Image, instruction: str) -> list[list[float]]:
@@ -134,7 +155,8 @@ class BatchInferenceEngine:
 
                 # Return results to each waiting thread
                 for i, (_, _, event, result) in enumerate(pending):
-                    result[0] = postprocess(preds[i])
+                    result[0] = postprocess(preds[i], self.norm_action,
+                                                        self.norm_min, self.norm_max)
                     event.set()
 
             except Exception as e:
@@ -182,8 +204,11 @@ def handle_connection(conn: socket.socket, engine: BatchInferenceEngine,
         print("Client disconnected.")
 
 
-def serve(vla, collate_fn, device: str, port: int, num_workers: int):
-    engine = BatchInferenceEngine(vla, collate_fn, device, max_batch_size=num_workers)
+def serve(vla, collate_fn, device: str, port: int, num_workers: int,
+          norm_action: bool = False, norm_min: float = -0.65, norm_max: float = 0.65):
+    engine = BatchInferenceEngine(vla, collate_fn, device, max_batch_size=num_workers,
+                                  norm_action=norm_action, norm_min=norm_min,
+                                  norm_max=norm_max)
     inference_thread = threading.Thread(target=engine.run, daemon=True)
     inference_thread.start()
 
@@ -225,11 +250,14 @@ def main():
     args = parser.parse_args()
 
     spec = MODEL_REGISTRY[args.model]
-    vla, processor = load_checkpoint(Path(args.checkpoint), args.device, spec)
+    vla, processor, hparams = load_checkpoint(Path(args.checkpoint), args.device, spec)
     collate_fn = make_calvin_collate_fn(processor, SYSTEM_PROMPT,
                                         max_length=spec.max_length,
                                         collate_style=spec.collate_style)
-    serve(vla, collate_fn, args.device, args.port, args.num_workers)
+    serve(vla, collate_fn, args.device, args.port, args.num_workers,
+          norm_action=hparams.get("norm_action", False),
+          norm_min=hparams.get("norm_min", -0.65),
+          norm_max=hparams.get("norm_max", 0.65))
 
 
 if __name__ == "__main__":

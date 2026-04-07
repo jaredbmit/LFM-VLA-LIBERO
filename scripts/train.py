@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 from vla import VLA, ACTION_TOKEN, CHUNK_SIZE, MODEL_REGISTRY, SYSTEM_PROMPT
-from vla.config import ACTION_DIM, GRIPPER_LOSS_WEIGHT, RGB_PAD
+from vla.config import ACTION_DIM, GRIPPER_LOSS_WEIGHT, RGB_PAD, NORM_ACTION, NORM_MIN, NORM_MAX
 from vla.data import CALVINDataset, make_calvin_collate_fn
 
 # CALVIN_BASE = "/home/jared/drl/calvin/dataset/task_D_D_annotated"
@@ -27,8 +27,10 @@ LOG_EVERY = 100
 EVAL_EVERY = 3000
 SAVE_EVERY = 1e8  # unused
 MAX_VAL_BATCHES = 500
-LR = 1e-5
-WARMUP_STEPS = 1000  # linear warmup before cosine decay
+LR = 2e-5
+WEIGHT_DECAY = 1e-4
+WARMUP_STEPS = 1000
+LR_SCHEDULE = "constant"  # "constant" | "cosine"
 GRAD_CLIP = 1.0
 
 
@@ -61,6 +63,13 @@ def main():
                         help="VLM backbone to use (default: LFM2-VL-450M)")
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--grad_steps", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=LR)
+    parser.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY)
+    parser.add_argument("--lr_schedule", choices=["constant", "cosine"], default=LR_SCHEDULE)
+    parser.add_argument("--warmup_steps", type=int, default=WARMUP_STEPS)
+    parser.add_argument("--norm_action", action=argparse.BooleanOptionalAction, default=NORM_ACTION)
+    parser.add_argument("--norm_min", type=float, default=NORM_MIN)
+    parser.add_argument("--norm_max", type=float, default=NORM_MAX)
     args = parser.parse_args()
     spec = MODEL_REGISTRY[args.model]
     batch_size = args.batch_size if args.batch_size is not None else spec.default_batch_size
@@ -69,9 +78,12 @@ def main():
     hparams = {
         "model": args.model, "model_id": spec.model_id,
         "calvin_base": CALVIN_BASE,
-        "batch_size": batch_size, "grad_steps": grad_steps, "num_steps": NUM_STEPS, "lr": LR,
-        "warmup_steps": WARMUP_STEPS, "grad_clip": GRAD_CLIP,
+        "batch_size": batch_size, "grad_steps": grad_steps, "num_steps": NUM_STEPS,
+        "lr": args.lr, "weight_decay": args.weight_decay,
+        "lr_schedule": args.lr_schedule, "warmup_steps": args.warmup_steps,
+        "grad_clip": GRAD_CLIP,
         "action_dim": ACTION_DIM, "chunk_size": CHUNK_SIZE, "max_length": spec.max_length,
+        "norm_action": args.norm_action, "norm_min": args.norm_min, "norm_max": args.norm_max,
     }
     with open(run_dir / "hparams.json", "w") as f:
         json.dump(hparams, f, indent=2)
@@ -105,8 +117,12 @@ def main():
     print(f"Trainable: {trainable:,} / {total:,} params ({100 * trainable / total:.2f}%)")
 
     train_ds = CALVINDataset(f"{CALVIN_BASE}/training", chunk_size=CHUNK_SIZE,
-                             rgb_pad=RGB_PAD)
-    val_ds = CALVINDataset(f"{CALVIN_BASE}/validation", chunk_size=CHUNK_SIZE)
+                             rgb_pad=RGB_PAD,
+                             norm_action=args.norm_action,
+                             norm_min=args.norm_min, norm_max=args.norm_max)
+    val_ds = CALVINDataset(f"{CALVIN_BASE}/validation", chunk_size=CHUNK_SIZE,
+                           norm_action=args.norm_action,
+                           norm_min=args.norm_min, norm_max=args.norm_max)
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
     collate_fn = make_calvin_collate_fn(processor, SYSTEM_PROMPT, max_length=spec.max_length,
                                         collate_style=spec.collate_style)
@@ -115,11 +131,17 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
     trainable_params = [p for p in vla.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=LR)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=LR, total_steps=NUM_STEPS,
-        pct_start=WARMUP_STEPS / NUM_STEPS, anneal_strategy="cos",
-    )
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr,
+                                  weight_decay=args.weight_decay)
+    if args.lr_schedule == "cosine":
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=args.lr, total_steps=NUM_STEPS,
+            pct_start=args.warmup_steps / NUM_STEPS, anneal_strategy="cos",
+        )
+    else:  # "constant"
+        from transformers.optimization import get_constant_schedule_with_warmup
+        scheduler = get_constant_schedule_with_warmup(optimizer,
+                                                      num_warmup_steps=args.warmup_steps)
     huber_fn = nn.SmoothL1Loss()
     bce_fn = nn.BCEWithLogitsLoss()
 

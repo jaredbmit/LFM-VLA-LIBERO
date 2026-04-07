@@ -14,6 +14,12 @@ MAX_LENGTH = 512
 RGB_PAD = 10
 GRIPPER_LOSS_WEIGHT = 0.01
 
+# Action normalization: clip pose dims to [NORM_MIN, NORM_MAX] then rescale to [-1, 1].
+# Gripper dim is left untouched.  Set NORM_ACTION=False to disable.
+NORM_ACTION = True
+NORM_MIN = -0.65
+NORM_MAX = 0.65
+
 
 @dataclass
 class ModelSpec:
