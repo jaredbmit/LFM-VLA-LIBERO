@@ -27,12 +27,13 @@ import torch
 from PIL import Image
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-from vla import VLA, ACTION_TOKEN, CHUNK_SIZE, MODEL_REGISTRY, SYSTEM_PROMPT
+from vla import (ACTION_TOKEN, CHUNK_SIZE, MODEL_REGISTRY, SYSTEM_PROMPT,
+                 VLA, FlowMatchingVLA)
 from vla.config import ACTION_DIM
 from vla.data import make_calvin_collate_fn, unnormalize_action
 
 
-def load_checkpoint(ckpt_dir: Path, device: str, spec):
+def load_checkpoint(ckpt_dir: Path, device: str, spec, flow_steps: int = 10):
     print(f"Loading processor from {ckpt_dir / 'vlm'}...")
     processor = AutoProcessor.from_pretrained(ckpt_dir / "vlm")
     tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
@@ -44,12 +45,14 @@ def load_checkpoint(ckpt_dir: Path, device: str, spec):
     )
 
     action_token_id = tok.convert_tokens_to_ids(ACTION_TOKEN)
-    vla = VLA(vlm, action_token_id=action_token_id, hidden_dim=spec.hidden_dim).to(device)
-
     ckpt = torch.load(ckpt_dir / "action_head.pt", map_location=device, weights_only=True)
-    vla.proj.load_state_dict(ckpt["proj"])
-    vla.pose_head.load_state_dict(ckpt["pose_head"])
-    vla.gripper_head.load_state_dict(ckpt["gripper_head"])
+    cls = FlowMatchingVLA if ckpt.get("head", "mlp") == "flow" else VLA
+    vla = cls.from_checkpoint(
+        vlm, ckpt,
+        hidden_dim=spec.hidden_dim,
+        action_token_id=action_token_id,
+        n_steps_inference=flow_steps,
+    ).to(device)
     vla.eval()
 
     # Load hparams to recover normalization settings
@@ -59,7 +62,8 @@ def load_checkpoint(ckpt_dir: Path, device: str, spec):
         with open(hparams_path) as f:
             hparams = json.load(f)
 
-    print(f"Loaded checkpoint from step {ckpt['step']}, val_loss={ckpt['val_loss']:.6f}")
+    print(f"Loaded {ckpt.get('head', 'mlp')} checkpoint from step {ckpt['step']}, "
+          f"val_loss={ckpt['val_loss']:.6f}")
     if hparams.get("norm_action"):
         print(f"  norm_action=True, norm_min={hparams['norm_min']}, norm_max={hparams['norm_max']}")
     return vla, processor, hparams
@@ -68,21 +72,27 @@ def load_checkpoint(ckpt_dir: Path, device: str, spec):
 def postprocess(pred_chunk: torch.Tensor,
                 norm_action: bool = False,
                 norm_min: float = -0.65,
-                norm_max: float = 0.65) -> list[list[float]]:
+                norm_max: float = 0.65,
+                flow_head: bool = False) -> list[list[float]]:
     """Convert raw model output to CALVIN-compatible actions.
 
-    pred_chunk: (chunk_size, 7) — dims 0-5 are pose deltas, dim 6 is gripper logit.
-    If norm_action is True, pose dims are unnormalized from [-1,1] back to
-    [norm_min, norm_max] before being sent to the environment.
+    pred_chunk: (chunk_size, 7)
+      mlp head: dims 0-5 are Tanh-bounded pose deltas, dim 6 is gripper logit.
+      flow head: dims 0-5 are continuous pose, dim 6 is continuous gripper value.
     """
     actions = []
     for t in range(pred_chunk.shape[0]):
-        a = pred_chunk[t].cpu().numpy().copy()
+        a = pred_chunk[t].cpu().float().numpy().copy()
         if norm_action:
             a = unnormalize_action(a, norm_min, norm_max)
         a[:6] = np.clip(a[:6], -1.0, 1.0)
-        gripper_prob = 1.0 / (1.0 + np.exp(-float(a[6])))
-        a[6] = 1.0 if gripper_prob > 0.5 else -1.0
+        if flow_head:
+            # Continuous value: threshold at 0 to get {-1, 1}
+            a[6] = 1.0 if float(a[6]) > 0.0 else -1.0
+        else:
+            # Logit: apply sigmoid then threshold at 0.5
+            gripper_prob = 1.0 / (1.0 + np.exp(-float(a[6])))
+            a[6] = 1.0 if gripper_prob > 0.5 else -1.0
         actions.append(a.tolist())
     return actions
 
@@ -107,6 +117,7 @@ class BatchInferenceEngine:
         self.norm_action = norm_action
         self.norm_min = norm_min
         self.norm_max = norm_max
+        self._is_flow = isinstance(vla, FlowMatchingVLA)
         self._queue: queue.Queue = queue.Queue()
 
     def submit(self, image: Image.Image, instruction: str) -> list[list[float]]:
@@ -158,8 +169,8 @@ class BatchInferenceEngine:
 
                 # Return results to each waiting thread
                 for i, (_, _, event, result) in enumerate(pending):
-                    result[0] = postprocess(preds[i], self.norm_action,
-                                                        self.norm_min, self.norm_max)
+                    result[0] = postprocess(preds[i], self.norm_action, self.norm_min,
+                                            self.norm_max, flow_head=self._is_flow)
                     event.set()
 
             except Exception as e:
@@ -250,10 +261,13 @@ def main():
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--num_workers", type=int, default=1,
                         help="Number of parallel eval worker clients (sets max batch size)")
+    parser.add_argument("--flow_steps", type=int, default=10,
+                        help="Denoising steps for flow matching head (ignored for mlp head)")
     args = parser.parse_args()
 
     spec = MODEL_REGISTRY[args.model]
-    vla, processor, hparams = load_checkpoint(Path(args.checkpoint), args.device, spec)
+    vla, processor, hparams = load_checkpoint(Path(args.checkpoint), args.device, spec,
+                                              flow_steps=args.flow_steps)
     collate_fn = make_calvin_collate_fn(processor, SYSTEM_PROMPT,
                                         max_length=spec.max_length,
                                         collate_style=spec.collate_style)

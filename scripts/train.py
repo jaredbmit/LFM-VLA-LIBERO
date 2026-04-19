@@ -9,19 +9,18 @@ from pathlib import Path
 import argparse
 
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-from vla import VLA, ACTION_TOKEN, CHUNK_SIZE, MODEL_REGISTRY, SYSTEM_PROMPT
-from vla.config import ACTION_DIM, GRIPPER_LOSS_WEIGHT, RGB_PAD, NORM_ACTION, NORM_MIN, NORM_MAX
+from vla import VLA, FlowMatchingVLA, ACTION_TOKEN, CHUNK_SIZE, MODEL_REGISTRY, SYSTEM_PROMPT
+from vla.config import ACTION_DIM, RGB_PAD, NORM_ACTION, NORM_MIN, NORM_MAX
 from vla.data import CALVINDataset, make_calvin_collate_fn
 
-# CALVIN_BASE = "/home/jared/drl/calvin/dataset/calvin_debug_dataset"
-# RUN_DIR = "/home/jared/lfm-vla/runs"
+CALVIN_BASE = "/home/jared/drl/calvin/dataset/calvin_debug_dataset"
+RUN_DIR = "/home/jared/lfm-vla/runs"
 
-CALVIN_BASE = "/home/schmidt/ssci-jaredb/scratch_ssci-rus/jaredb/datasets/CALVIN/task_ABC_D_annotated"
-RUN_DIR = "/home/schmidt/ssci-jaredb/scratch_ssci-rus/jaredb/runs/v6"
+# CALVIN_BASE = "/home/schmidt/ssci-jaredb/scratch_ssci-rus/jaredb/datasets/CALVIN/task_ABC_D_annotated"
+# RUN_DIR = "/home/schmidt/ssci-jaredb/scratch_ssci-rus/jaredb/runs/v6"
 
 
 # HPPs
@@ -41,14 +40,8 @@ def save_checkpoint(run_dir: Path, tag: str, vla, processor, step, val_loss):
     ckpt_dir = run_dir / "checkpoints" / tag
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    torch.save({
-        "step": step,
-        "val_loss": val_loss,
-        "proj": vla.proj.state_dict(),
-        "pose_head": vla.pose_head.state_dict(),
-        "gripper_head": vla.gripper_head.state_dict(),
-    }, ckpt_dir / "action_head.pt")
-
+    torch.save({"step": step, "val_loss": val_loss, **vla.head_state_dict()},
+               ckpt_dir / "action_head.pt")
     vla.vlm.save_pretrained(ckpt_dir / "vlm")
     processor.save_pretrained(ckpt_dir / "vlm")
 
@@ -73,6 +66,16 @@ def main():
     parser.add_argument("--norm_action", action=argparse.BooleanOptionalAction, default=NORM_ACTION)
     parser.add_argument("--norm_min", type=float, default=NORM_MIN)
     parser.add_argument("--norm_max", type=float, default=NORM_MAX)
+    parser.add_argument("--head", choices=["mlp", "flow"], default="mlp",
+                        help="Action head type: mlp (default) or flow (flow matching transformer)")
+    parser.add_argument("--flow_steps", type=int, default=10,
+                        help="Denoising steps for inference latency benchmark (flow head only)")
+    parser.add_argument("--d_model", type=int, default=256,
+                        help="Flow head transformer width (flow head only)")
+    parser.add_argument("--n_heads", type=int, default=8,
+                        help="Flow head attention heads (flow head only)")
+    parser.add_argument("--n_layers", type=int, default=4,
+                        help="Flow head transformer depth (flow head only)")
     args = parser.parse_args()
     spec = MODEL_REGISTRY[args.model]
     batch_size = args.batch_size if args.batch_size is not None else spec.default_batch_size
@@ -87,6 +90,9 @@ def main():
         "grad_clip": GRAD_CLIP,
         "action_dim": ACTION_DIM, "chunk_size": CHUNK_SIZE, "max_length": spec.max_length,
         "norm_action": args.norm_action, "norm_min": args.norm_min, "norm_max": args.norm_max,
+        "head": args.head,
+        **({"d_model": args.d_model, "n_heads": args.n_heads, "n_layers": args.n_layers,
+            "flow_steps": args.flow_steps} if args.head == "flow" else {}),
     }
     with open(run_dir / "hparams.json", "w") as f:
         json.dump(hparams, f, indent=2)
@@ -112,7 +118,16 @@ def main():
 
     device = next(vlm.parameters()).device
     action_token_id = tok.convert_tokens_to_ids(ACTION_TOKEN)
-    vla = VLA(vlm, action_token_id=action_token_id, hidden_dim=spec.hidden_dim, chunk_size=CHUNK_SIZE).to(device)
+    if args.head == "flow":
+        vla = FlowMatchingVLA(
+            vlm, hidden_dim=spec.hidden_dim, chunk_size=CHUNK_SIZE,
+            d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers,
+            n_steps_inference=args.flow_steps,
+        ).to(device)
+        print(f"Flow head fusion layer: {vla.fusion_layer_idx} (~70% depth)")
+    else:
+        vla = VLA(vlm, action_token_id=action_token_id, hidden_dim=spec.hidden_dim,
+                  chunk_size=CHUNK_SIZE).to(device)
 
     trainable = sum(p.numel() for p in vla.parameters() if p.requires_grad)
     total = sum(p.numel() for p in vla.parameters())
@@ -145,23 +160,6 @@ def main():
         from transformers.optimization import get_constant_schedule_with_warmup
         scheduler = get_constant_schedule_with_warmup(optimizer,
                                                       num_warmup_steps=args.warmup_steps)
-    huber_fn = nn.SmoothL1Loss(reduction="none")
-    bce_fn = nn.BCEWithLogitsLoss(reduction="none")
-
-    def loss_fn(pred, gt, action_mask):
-        # action_mask: (B, chunk_size) — 1 for valid, 0 for padded
-        # Expand mask for pose dims: (B, chunk, 1)
-        mask = action_mask.unsqueeze(-1)
-
-        pose_loss = huber_fn(pred[:, :, :6], gt[:, :, :6])  # (B, chunk, 6)
-        pose_loss = (pose_loss * mask).sum() / mask.sum() / 6
-
-        gripper_target = (gt[:, :, 6] + 1) / 2  # {-1, 1} -> {0, 1}
-        gripper_loss = bce_fn(pred[:, :, 6], gripper_target)  # (B, chunk)
-        gripper_loss = (gripper_loss * action_mask).sum() / action_mask.sum()
-
-        return pose_loss + GRIPPER_LOSS_WEIGHT * gripper_loss
-
     print(f"\nTraining: {len(train_ds)} samples, {len(val_ds)} val, "
           f"{NUM_STEPS} steps, grad_steps={grad_steps}, chunk_size={CHUNK_SIZE}\n")
 
@@ -184,7 +182,7 @@ def main():
         act_mask = batch.pop("action_mask").to(device)
         batch = {k: v.to(device) for k, v in batch.items()}
 
-        loss = loss_fn(vla(**batch), gt_actions, act_mask)
+        loss = vla.compute_loss(batch, gt_actions, act_mask)
         (loss / grad_steps).backward()
         running_loss += loss.item()
 
@@ -215,7 +213,7 @@ def main():
                     gt = val_batch.pop("gt_actions").to(device)
                     val_mask = val_batch.pop("action_mask").to(device)
                     val_batch = {k: v.to(device) for k, v in val_batch.items()}
-                    val_loss_sum += loss_fn(vla(**val_batch), gt, val_mask).item()
+                    val_loss_sum += vla.compute_loss(val_batch, gt, val_mask).item()
                     val_steps += 1
                     if val_steps >= MAX_VAL_BATCHES:
                         break

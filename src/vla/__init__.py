@@ -3,4 +3,4 @@ from vla.config import (
     MAX_LENGTH, MODEL_REGISTRY, NORM_ACTION, NORM_MAX, NORM_MIN,
     RGB_PAD, SYSTEM_PROMPT,
 )
-from vla.model import VLA
+from vla.model import VLA, FlowMatchingVLA
