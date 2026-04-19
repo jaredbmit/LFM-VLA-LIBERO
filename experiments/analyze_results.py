@@ -26,16 +26,21 @@ import pandas as pd
 # ── model display config ──────────────────────────────────────────────────────
 
 MODEL_COLORS = {
-    "LFM2-VL-450M":            "#77BDD3",
-    "LFM2-VL-1.6B":            "#4A7AC2",
-    "LFM2-VL-3B":              "#3844B8",
-    "Qwen3-VL-2B-Instruct":    "#6BAC7A",
-    "Qwen2.5-VL-3B-Instruct":  "#3A9E50",
-    "Qwen3-VL-4B-Instruct":    "#1C810F",
-    "SmolVLM-256M-Instruct":   "#CFA061",
-    "SmolVLM-500M-Instruct":   "#DA8540",
-    "SmolVLM-Instruct":        "#E06F12",
-    "paligemma2-3b-mix-224":   "#963AD3",
+    "LFM2-VL-450M":                 "#77BDD3",
+    "LFM2-VL-1.6B":                 "#4A7AC2",
+    "LFM2-VL-3B":                   "#3844B8",
+    "LFM2.5-VL-450M":               "#A677D3",
+    "LFM2.5-VL-1.6B":               "#8828E2",
+    "LFM2.5-VL-450M-Grounding-v1":  "#D37777",
+    "LFM2.5-VL-450M-Grounding-v2":  "#DA4747",
+    "LFM2.5-VL-450M-Grounding-v3":  "#F10F0F",
+    "Qwen3-VL-2B-Instruct":         "#6BAC7A",
+    "Qwen2.5-VL-3B-Instruct":       "#3A9E50",
+    "Qwen3-VL-4B-Instruct":         "#1C810F",
+    "SmolVLM-256M-Instruct":        "#CFA061",
+    "SmolVLM-500M-Instruct":        "#DA8540",
+    "SmolVLM-Instruct":             "#E06F12",
+    "paligemma2-3b-mix-224":        "#963AD3",
 }
 
 # Canonical display order: LFM (small→large), Qwen (small→large), SmolVLM (small→large), other
@@ -43,6 +48,11 @@ MODEL_ORDER = [
     "LFM2-VL-450M",
     "LFM2-VL-1.6B",
     "LFM2-VL-3B",
+    "LFM2.5-VL-450M",
+    "LFM2.5-VL-1.6B",
+    "LFM2.5-VL-450M-Grounding-v1",
+    "LFM2.5-VL-450M-Grounding-v2",
+    "LFM2.5-VL-450M-Grounding-v3",
     "Qwen3-VL-2B-Instruct",
     "Qwen2.5-VL-3B-Instruct",
     "Qwen3-VL-4B-Instruct",
@@ -223,8 +233,8 @@ def plot_loss_curves(models_data: dict, out_dir: Path):
         ax.grid(True, alpha=0.3)
         ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
 
-    ax_train.set_ylim(0.01, 0.05)
-    ax_val.set_ylim(0.01, 0.05)
+    ax_train.set_ylim(0.005, 0.04)
+    ax_val.set_ylim(0.005, 0.04)
 
     fig.suptitle("VLA Training Curves (CALVIN ABC→D)", fontsize=13, fontweight="bold")
     fig.tight_layout()
@@ -281,8 +291,8 @@ def animate_loss_curves(models_data: dict, out_dir: Path, fps: int = 30,
         ax.set_xlim(0, max_step * 1.02)
         ax.grid(True, alpha=0.3)
         ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
-    ax_train.set_ylim(0.01, 0.05)
-    ax_val.set_ylim(0.01, 0.05)
+    ax_train.set_ylim(0.005, 0.04)
+    ax_val.set_ylim(0.005, 0.04)
 
     train_lines = {}
     val_lines = {}
@@ -328,10 +338,16 @@ def animate_loss_curves(models_data: dict, out_dir: Path, fps: int = 30,
 
 
 def _plot_calvin_ax(ax, models_data: dict, eval_key: str, title: str):
-    """Populate a single axes with chain SR bars for the given eval_key."""
+    """Populate a single axes with chain SR bars for the given eval_key.
+
+    Layout: [Avg] | SR-1 SR-2 SR-3 SR-4 SR-5, with a vertical separator
+    between the Avg group and the SR-k groups.
+    """
     models = sort_models([m for m, d in models_data.items() if d.get(eval_key) is not None])
     ks = [1, 2, 3, 4, 5]
-    x = np.arange(len(ks))
+    # Avg gets x=0; SR-k get x=1..5 so there's an extra unit of space between them.
+    x_avg = np.array([0.0])
+    x_sr = np.arange(1, 1 + len(ks), dtype=float)
     n_models = len(models)
     bar_width = 0.8 / n_models if n_models else 0.8
 
@@ -339,12 +355,19 @@ def _plot_calvin_ax(ax, models_data: dict, eval_key: str, title: str):
         result = models_data[model][eval_key]
         chain_sr = result.get("chain_sr", {})
         sr_vals = [chain_sr.get(str(k), 0.0) * 100 for k in ks]
+        avg_val = avg_chain_sr(chain_sr) * 100
         offset = (i - n_models / 2 + 0.5) * bar_width
-        ax.bar(x + offset, sr_vals, bar_width * 0.9,
-               label=model, color=MODEL_COLORS.get(model, None), alpha=0.85)
+        color = MODEL_COLORS.get(model, None)
+        ax.bar(x_avg + offset, [avg_val], bar_width * 0.9,
+               color=color, alpha=0.85)
+        ax.bar(x_sr + offset, sr_vals, bar_width * 0.9,
+               label=model, color=color, alpha=0.85)
 
-    ax.set_xticks(x)
-    ax.set_xticklabels([f"SR-{k}" for k in ks])
+    # Vertical separator between Avg and SR-k groups
+    ax.axvline(0.5, color="black", linewidth=1.0, alpha=0.6)
+
+    ax.set_xticks(np.concatenate([x_avg, x_sr]))
+    ax.set_xticklabels(["Avg"] + [f"SR-{k}" for k in ks])
     ax.set_ylim(0, 100)
     ax.set_ylabel("Success Rate (%)")
     ax.set_title(title, fontsize=11, fontweight="bold")

@@ -180,9 +180,9 @@ def save_video(frames: list, path: Path, fps: int = 30):
     print(f"  Saved video: {path}")
 
 
-def print_and_save(results, sequences, log_dir, num_sequences):
-    avg_seq_len = np.mean(results)
-    chain_sr = {i + 1: sr for i, sr in enumerate(count_success(results))}
+def print_and_save(results, sequences, log_dir, num_sequences, seq_indices=None):
+    avg_seq_len = float(np.mean(results))
+    chain_sr = {i + 1: float(sr) for i, sr in enumerate(count_success(results))}
 
     print(f"\nResults ({num_sequences} sequences):")
     print(f"  Average successful sequence length: {avg_seq_len:.2f}")
@@ -205,10 +205,26 @@ def print_and_save(results, sequences, log_dir, num_sequences):
         task_info[task] = {"success": cnt_success[task], "total": total[task]}
         print(f"    {task}: {cnt_success[task]}/{total[task]} ({cnt_success[task]/total[task]*100:.1f}%)")
 
+    # Per-sequence records for computing spread / CIs downstream. Keeping
+    # top-level keys (avg_seq_len, chain_sr, task_info) unchanged so existing
+    # analysis tooling (experiments/analyze_results.py) still works.
+    if seq_indices is None:
+        seq_indices = list(range(len(results)))
+    per_seq = []
+    for global_idx, result, (_, sequence) in zip(seq_indices, results, sequences):
+        per_seq.append({
+            "seq_idx": int(global_idx),
+            "tasks": list(sequence),
+            "completed": int(result),
+            "num_tasks": len(sequence),
+        })
+
     data = {
         "avg_seq_len": avg_seq_len,
         "chain_sr": chain_sr,
         "task_info": task_info,
+        "num_sequences": len(results),
+        "sequences": per_seq,
     }
 
     if log_dir:
@@ -386,12 +402,16 @@ def main():
             for p in processes:
                 p.join(timeout=5.0)
 
-        results = [r for r in results if r is not None]
+        kept = [(i, r) for i, r in enumerate(results) if r is not None]
+        seq_indices = [i for i, _ in kept]
+        results = [r for _, r in kept]
+        kept_sequences = [eval_sequences[i] for i in seq_indices]
 
         elapsed = time.time() - start_time
         print(f"\nEvaluation took {elapsed:.0f}s ({elapsed/3600:.1f}h)")
         if results:
-            print_and_save(results, eval_sequences[:len(results)], args.eval_log_dir, len(results))
+            print_and_save(results, kept_sequences, args.eval_log_dir,
+                           len(results), seq_indices=seq_indices)
 
 
 if __name__ == "__main__":
