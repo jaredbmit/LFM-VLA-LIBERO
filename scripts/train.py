@@ -13,14 +13,15 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 from vla import VLA, FlowMatchingVLA, ACTION_TOKEN, CHUNK_SIZE, MODEL_REGISTRY, SYSTEM_PROMPT
+from vla.model import masked_action_mse
 from vla.config import ACTION_DIM, RGB_PAD, NORM_ACTION, NORM_MIN, NORM_MAX
 from vla.data import CALVINDataset, make_calvin_collate_fn
 
-CALVIN_BASE = "/home/jared/drl/calvin/dataset/calvin_debug_dataset"
-RUN_DIR = "/home/jared/lfm-vla/runs"
+# CALVIN_BASE = "/home/jared/drl/calvin/dataset/calvin_debug_dataset"
+# RUN_DIR = "/home/jared/lfm-vla/runs"
 
-# CALVIN_BASE = "/home/schmidt/ssci-jaredb/scratch_ssci-rus/jaredb/datasets/CALVIN/task_ABC_D_annotated"
-# RUN_DIR = "/home/schmidt/ssci-jaredb/scratch_ssci-rus/jaredb/runs/v6"
+CALVIN_BASE = "/home/schmidt/ssci-jaredb/scratch_ssci-rus/jaredb/datasets/CALVIN/task_ABC_D_annotated"
+RUN_DIR = "/home/schmidt/ssci-jaredb/scratch_ssci-rus/jaredb/runs/v6"
 
 
 # HPPs
@@ -131,7 +132,6 @@ def main():
 
     trainable = sum(p.numel() for p in vla.parameters() if p.requires_grad)
     total = sum(p.numel() for p in vla.parameters())
-    print("VLA trainable params: ")
     print(f"Trainable: {trainable:,} / {total:,} params ({100 * trainable / total:.2f}%)")
 
     train_ds = CALVINDataset(f"{CALVIN_BASE}/training", chunk_size=CHUNK_SIZE,
@@ -213,7 +213,8 @@ def main():
                     gt = val_batch.pop("gt_actions").to(device)
                     val_mask = val_batch.pop("action_mask").to(device)
                     val_batch = {k: v.to(device) for k, v in val_batch.items()}
-                    val_loss_sum += vla.compute_loss(val_batch, gt, val_mask).item()
+                    pred = vla.predict_actions(**val_batch)
+                    val_loss_sum += masked_action_mse(pred, gt, val_mask).item()
                     val_steps += 1
                     if val_steps >= MAX_VAL_BATCHES:
                         break

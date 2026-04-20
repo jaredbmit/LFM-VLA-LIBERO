@@ -8,6 +8,13 @@ from vla.config import ACTION_DIM, CHUNK_SIZE, GRIPPER_LOSS_WEIGHT
 from vla.flow_head import FlowMatchingHead
 
 
+def masked_action_mse(pred: torch.Tensor, gt: torch.Tensor,
+                      action_mask: torch.Tensor) -> torch.Tensor:
+    """MSE between predicted and ground-truth actions, masked by action_mask."""
+    mask = action_mask.unsqueeze(-1)
+    return ((pred - gt) ** 2 * mask).sum() / mask.sum() / pred.shape[-1]
+
+
 def _xavier_init(module: nn.Module):
     """Apply Xavier uniform initialization to all Linear layers in a module."""
     for m in module.modules():
@@ -77,6 +84,13 @@ class VLA(nn.Module):
         gripper = self.gripper_head(h).view(-1, self.chunk_size, 1)  # (B, chunk, 1)
 
         return torch.cat([pose, gripper], dim=-1)  # (B, chunk_size, 7)
+
+    @torch.no_grad()
+    def predict_actions(self, **vlm_inputs) -> torch.Tensor:
+        """Return actions with gripper mapped to [-1, 1] via sigmoid (matches eval-time postprocess)."""
+        pred = self(**vlm_inputs)
+        gripper = 2 * torch.sigmoid(pred[..., 6:7]) - 1
+        return torch.cat([pred[..., :6], gripper], dim=-1)
 
     def compute_loss(self, vlm_inputs: dict, gt_actions: torch.Tensor,
                      action_mask: torch.Tensor) -> torch.Tensor:
@@ -190,6 +204,11 @@ class FlowMatchingVLA(nn.Module):
             t = torch.full((B,), i * dt, device=ctx.device, dtype=torch.float32)
             x = x + self.flow_head(x, t, ctx, ctx_mask) * dt
         return x
+
+    @torch.no_grad()
+    def predict_actions(self, **vlm_inputs) -> torch.Tensor:
+        """Full denoising pass; returns actions in the same space as gt_actions."""
+        return self(**vlm_inputs)
 
     def compute_loss(self, vlm_inputs: dict, gt_actions: torch.Tensor,
                      action_mask: torch.Tensor) -> torch.Tensor:
