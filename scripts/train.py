@@ -11,11 +11,13 @@ import argparse
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers.optimization import get_constant_schedule_with_warmup
 
-from vla import VLA, FlowMatchingVLA, ACTION_TOKEN, CHUNK_SIZE, MODEL_REGISTRY, SYSTEM_PROMPT
-from vla.model import masked_action_mse
+from vla import VLA, FlowMatchingVLA, CHUNK_SIZE, MODEL_REGISTRY, SYSTEM_PROMPT
+from vla.model import install_action_token, masked_action_mse
 from vla.config import ACTION_DIM, RGB_PAD, NORM_ACTION, NORM_MIN, NORM_MAX
 from vla.data import CALVINDataset, make_calvin_collate_fn
+from vla.freeze import FREEZE_MODES, apply_freeze, reapply_eval
 
 # CALVIN_BASE = "/home/jared/drl/calvin/dataset/calvin_debug_dataset"
 # RUN_DIR = "/home/jared/lfm-vla/runs"
@@ -77,6 +79,10 @@ def main():
                         help="Flow head attention heads (flow head only)")
     parser.add_argument("--n_layers", type=int, default=4,
                         help="Flow head transformer depth (flow head only)")
+    parser.add_argument("--freeze", choices=FREEZE_MODES, default="none",
+                        help="Freeze a semantic group of the VLM: vision (tower+connector), "
+                             "language (LM+lm_head), or all. Action head + action_query "
+                             "(MLP head only) always stay trainable.")
     args = parser.parse_args()
     spec = MODEL_REGISTRY[args.model]
     batch_size = args.batch_size if args.batch_size is not None else spec.default_batch_size
@@ -92,6 +98,7 @@ def main():
         "action_dim": ACTION_DIM, "chunk_size": CHUNK_SIZE, "max_length": spec.max_length,
         "norm_action": args.norm_action, "norm_min": args.norm_min, "norm_max": args.norm_max,
         "head": args.head,
+        "freeze": args.freeze,
         **({"d_model": args.d_model, "n_heads": args.n_heads, "n_layers": args.n_layers,
             "flow_steps": args.flow_steps} if args.head == "flow" else {}),
     }
@@ -109,16 +116,13 @@ def main():
     processor = AutoProcessor.from_pretrained(spec.model_id, **spec.processor_kwargs)
     tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     tok.padding_side = "right"
-    tok.add_special_tokens({"additional_special_tokens": [ACTION_TOKEN]})
 
     print("Loading VLM...")
     vlm = AutoModelForImageTextToText.from_pretrained(
         spec.model_id, **spec.model_kwargs,
     ).to("cuda")
-    vlm.resize_token_embeddings(len(tok))
 
     device = next(vlm.parameters()).device
-    action_token_id = tok.convert_tokens_to_ids(ACTION_TOKEN)
     if args.head == "flow":
         vla = FlowMatchingVLA(
             vlm, hidden_dim=spec.hidden_dim, chunk_size=CHUNK_SIZE,
@@ -127,8 +131,15 @@ def main():
         ).to(device)
         print(f"Flow head fusion layer: {vla.fusion_layer_idx} (~70% depth)")
     else:
+        action_token_id = install_action_token(tok, vlm)
         vla = VLA(vlm, action_token_id=action_token_id, hidden_dim=spec.hidden_dim,
                   chunk_size=CHUNK_SIZE).to(device)
+
+    freeze_report = apply_freeze(vla, args.freeze, spec.freeze_groups)
+    if freeze_report.frozen_paths:
+        print(f"Freeze mode={args.freeze}: froze {freeze_report.frozen_paths}")
+    if freeze_report.skipped_paths:
+        print(f"  WARNING: skipped (not found on this VLM): {freeze_report.skipped_paths}")
 
     trainable = sum(p.numel() for p in vla.parameters() if p.requires_grad)
     total = sum(p.numel() for p in vla.parameters())
@@ -142,8 +153,11 @@ def main():
                            norm_action=args.norm_action,
                            norm_min=args.norm_min, norm_max=args.norm_max)
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
+
+    # Only the MLP head asks the collator to insert the <action> sentinel.
+    action_token_id = getattr(vla, "action_token_id", None)
     collate_fn = make_calvin_collate_fn(processor, SYSTEM_PROMPT, max_length=spec.max_length,
-                                        collate_style=spec.collate_style)
+                                        action_token_id=action_token_id)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
@@ -157,13 +171,16 @@ def main():
             pct_start=args.warmup_steps / NUM_STEPS, anneal_strategy="cos",
         )
     else:  # "constant"
-        from transformers.optimization import get_constant_schedule_with_warmup
         scheduler = get_constant_schedule_with_warmup(optimizer,
                                                       num_warmup_steps=args.warmup_steps)
     print(f"\nTraining: {len(train_ds)} samples, {len(val_ds)} val, "
           f"{NUM_STEPS} steps, grad_steps={grad_steps}, chunk_size={CHUNK_SIZE}\n")
 
-    vla.train()
+    def set_train_mode():
+        vla.train()
+        reapply_eval(vla, args.freeze, spec.freeze_groups)
+
+    set_train_mode()
     optimizer.zero_grad()
     train_iter = iter(train_loader)
     running_loss = 0.0  # sum of raw losses over micro-steps, reset every LOG_EVERY optimizer steps
@@ -232,7 +249,7 @@ def main():
                 best_val_loss = val_loss
                 save_checkpoint(run_dir, "best", vla, processor, update_step, val_loss)
 
-            vla.train()
+            set_train_mode()
 
         if update_step % SAVE_EVERY == 0:
             save_checkpoint(run_dir, f"step_{update_step}", vla, processor, update_step, best_val_loss)

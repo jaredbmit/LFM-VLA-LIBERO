@@ -27,9 +27,10 @@ import torch
 from PIL import Image
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-from vla import (ACTION_TOKEN, CHUNK_SIZE, MODEL_REGISTRY, SYSTEM_PROMPT,
+from vla import (CHUNK_SIZE, MODEL_REGISTRY, SYSTEM_PROMPT,
                  VLA, FlowMatchingVLA)
 from vla.config import ACTION_DIM
+from vla.model import install_action_token
 from vla.data import make_calvin_collate_fn, unnormalize_action
 
 
@@ -44,14 +45,18 @@ def load_checkpoint(ckpt_dir: Path, device: str, spec, flow_steps: int = 10):
         ckpt_dir / "vlm", device_map=device, torch_dtype=torch.bfloat16,
     )
 
-    action_token_id = tok.convert_tokens_to_ids(ACTION_TOKEN)
     ckpt = torch.load(ckpt_dir / "action_head.pt", map_location=device, weights_only=True)
-    cls = FlowMatchingVLA if ckpt.get("head", "mlp") == "flow" else VLA
+    head = ckpt.get("head", "mlp")
+    cls = FlowMatchingVLA if head == "flow" else VLA
+    extra = {}
+    if head == "mlp":
+        # Idempotent: the saved tokenizer already has <action>; this just looks it up.
+        extra["action_token_id"] = install_action_token(tok, vlm)
     vla = cls.from_checkpoint(
         vlm, ckpt,
         hidden_dim=spec.hidden_dim,
-        action_token_id=action_token_id,
         n_steps_inference=flow_steps,
+        **extra,
     ).to(device)
     vla.eval()
 
@@ -270,7 +275,7 @@ def main():
                                               flow_steps=args.flow_steps)
     collate_fn = make_calvin_collate_fn(processor, SYSTEM_PROMPT,
                                         max_length=spec.max_length,
-                                        collate_style=spec.collate_style)
+                                        action_token_id=getattr(vla, "action_token_id", None))
     serve(vla, collate_fn, args.device, args.port, args.num_workers,
           norm_action=hparams.get("norm_action", False),
           norm_min=hparams.get("norm_min", -0.65),

@@ -23,7 +23,6 @@ def inspect_model(model_name: str, dataset: CALVINDataset, sample_indices: list[
     spec = MODEL_REGISTRY[model_name]
     print(f"\n{'=' * 80}")
     print(f"MODEL: {model_name}  ({spec.model_id})")
-    print(f"  collate_style  = {spec.collate_style}")
     print(f"  processor_kwargs = {spec.processor_kwargs}")
     print(f"{'=' * 80}")
 
@@ -36,7 +35,7 @@ def inspect_model(model_name: str, dataset: CALVINDataset, sample_indices: list[
     collate_fn = make_calvin_collate_fn(
         processor, SYSTEM_PROMPT,
         max_length=spec.max_length,
-        collate_style=spec.collate_style,
+        action_token_id=action_token_id,
     )
 
     subset = Subset(dataset, sample_indices)
@@ -113,9 +112,6 @@ def _get_image_token_ids(tok, model_name: str) -> set[int]:
         for token_str, token_id in tok.added_tokens_encoder.items():
             if 'image' in token_str.lower() and 'pad' in token_str.lower():
                 candidates.add(token_id)
-
-    # PaliGemma uses a single <image> token (id 257152) repeated 256 times.
-    # No need for special range-based detection.
 
     return candidates
 

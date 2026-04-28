@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vla.config import ACTION_DIM, CHUNK_SIZE, GRIPPER_LOSS_WEIGHT
+from vla.config import ACTION_DIM, ACTION_TOKEN, CHUNK_SIZE, GRIPPER_LOSS_WEIGHT
 from vla.flow_head import FlowMatchingHead
 
 
@@ -24,7 +24,21 @@ def _xavier_init(module: nn.Module):
                 nn.init.zeros_(m.bias)
 
 
+def install_action_token(tokenizer, vlm) -> int:
+    """Register <action> in the tokenizer and resize the VLM embedding to match."""
+    if ACTION_TOKEN not in tokenizer.get_added_vocab():
+        tokenizer.add_special_tokens({"additional_special_tokens": [ACTION_TOKEN]})
+        vlm.resize_token_embeddings(len(tokenizer))
+    return tokenizer.convert_tokens_to_ids(ACTION_TOKEN)
+
+
 class VLA(nn.Module):
+    """MLP action head with a learnable <action> query token.
+
+    The caller is responsible for having already called
+    `install_action_token(tokenizer, vlm)` and passing the resulting id here.
+    """
+
     def __init__(self, vlm, action_token_id: int, hidden_dim: int,
                  action_dim=ACTION_DIM, chunk_size=CHUNK_SIZE):
         super().__init__()
@@ -32,6 +46,13 @@ class VLA(nn.Module):
         self.action_token_id = action_token_id
         self.chunk_size = chunk_size
         self.action_dim = action_dim
+        self.hidden_dim = hidden_dim
+
+        # Learnable action query — replaces the embedding lookup at action-token
+        # positions on every forward, so the underlying embed_tokens row is dead.
+        self.action_query = nn.Parameter(torch.zeros(hidden_dim))
+        nn.init.normal_(self.action_query, std=0.02)
+        self._register_action_query_hook()
 
         head_dim = 1024
 
@@ -68,6 +89,23 @@ class VLA(nn.Module):
         _xavier_init(self.proj)
         _xavier_init(self.pose_head)
         _xavier_init(self.gripper_head)
+
+    def _register_action_query_hook(self) -> None:
+        """Splice self.action_query into the embedding output at <action> positions."""
+        embed = self.vlm.get_input_embeddings()
+
+        def hook(module, inputs, output):
+            ids = inputs[0] if inputs else None
+            if ids is None:
+                return output
+            mask = (ids == self.action_token_id)
+            if not mask.any():
+                return output
+            output = output.clone()
+            output[mask] = self.action_query.to(output.dtype)
+            return output
+
+        embed.register_forward_hook(hook)
 
     def forward(self, **vlm_inputs):
         outputs = self.vlm(**vlm_inputs, output_hidden_states=True)
@@ -113,15 +151,19 @@ class VLA(nn.Module):
         """Serializable state for this head type (used by checkpointing)."""
         return {
             "head": "mlp",
+            "action_query": self.action_query.detach().cpu(),
             "proj": self.proj.state_dict(),
             "pose_head": self.pose_head.state_dict(),
             "gripper_head": self.gripper_head.state_dict(),
         }
 
     @classmethod
-    def from_checkpoint(cls, vlm, ckpt: dict, *, hidden_dim: int,
-                        action_token_id: int, **_) -> "VLA":
+    def from_checkpoint(cls, vlm, ckpt: dict, *, action_token_id: int,
+                        hidden_dim: int, **_) -> "VLA":
         vla = cls(vlm, action_token_id=action_token_id, hidden_dim=hidden_dim)
+        if "action_query" in ckpt:
+            with torch.no_grad():
+                vla.action_query.copy_(ckpt["action_query"].to(vla.action_query.device))
         vla.proj.load_state_dict(ckpt["proj"])
         vla.pose_head.load_state_dict(ckpt["pose_head"])
         vla.gripper_head.load_state_dict(ckpt["gripper_head"])
@@ -133,7 +175,7 @@ def _num_vlm_layers(vlm) -> int:
     cfg = vlm.config
     if hasattr(cfg, "num_hidden_layers"):
         return cfg.num_hidden_layers
-    # Nested config (e.g. PaLiGemma: config.text_config.num_hidden_layers)
+    # Some VLMs nest the LM config under `text_config`.
     if hasattr(cfg, "text_config") and hasattr(cfg.text_config, "num_hidden_layers"):
         return cfg.text_config.num_hidden_layers
     raise ValueError(f"Cannot determine num_hidden_layers from {type(cfg).__name__}")

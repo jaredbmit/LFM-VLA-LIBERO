@@ -40,7 +40,6 @@ MODEL_COLORS = {
     "SmolVLM-256M-Instruct":        "#CFA061",
     "SmolVLM-500M-Instruct":        "#DA8540",
     "SmolVLM-Instruct":             "#E06F12",
-    "paligemma2-3b-mix-224":        "#963AD3",
 }
 
 # Canonical display order: LFM (small→large), Qwen (small→large), SmolVLM (small→large), other
@@ -59,7 +58,6 @@ MODEL_ORDER = [
     "SmolVLM-256M-Instruct",
     "SmolVLM-500M-Instruct",
     "SmolVLM-Instruct",
-    "paligemma2-3b-mix-224",
 ]
 
 
@@ -233,8 +231,8 @@ def plot_loss_curves(models_data: dict, out_dir: Path):
         ax.grid(True, alpha=0.3)
         ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
 
-    ax_train.set_ylim(0.005, 0.04)
-    ax_val.set_ylim(0.005, 0.04)
+    ax_train.set_ylim(0.0, 1.0)
+    ax_val.set_ylim(0.0, 1.0)
 
     fig.suptitle("VLA Training Curves (CALVIN ABC→D)", fontsize=13, fontweight="bold")
     fig.tight_layout()
@@ -291,8 +289,8 @@ def animate_loss_curves(models_data: dict, out_dir: Path, fps: int = 30,
         ax.set_xlim(0, max_step * 1.02)
         ax.grid(True, alpha=0.3)
         ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
-    ax_train.set_ylim(0.005, 0.04)
-    ax_val.set_ylim(0.005, 0.04)
+    ax_train.set_ylim(0.0, 1.0)
+    ax_val.set_ylim(0.0, 1.0)
 
     train_lines = {}
     val_lines = {}

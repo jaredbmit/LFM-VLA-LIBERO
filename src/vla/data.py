@@ -8,7 +8,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from vla.config import ACTION_TOKEN, IMAGE_SIZE, RGB_PAD, INSTRUCTION_PREPROMPT, NORM_MIN, NORM_MAX
+from vla.config import IMAGE_SIZE, RGB_PAD, INSTRUCTION_PREPROMPT, NORM_MIN, NORM_MAX
 
 
 def normalize_action(action: np.ndarray, norm_min: float = NORM_MIN,
@@ -164,20 +164,19 @@ def _insert_token(vlm_inputs: dict, token_id: int, pad_token_id: int) -> dict:
 
 
 def make_calvin_collate_fn(processor, system_prompt: str, max_length: int = 512,
-                           collate_style: str = "chat_template"):
+                           action_token_id: int | None = None):
     """Returns a collate function that formats CALVIN samples for a VLM.
 
-    Both styles tokenize the image + instruction, then insert the <action> token
-    post-tokenization at the end of real content (before padding).
+    Builds system+user conversations and tokenizes via `processor.apply_chat_template`.
 
-    collate_style="chat_template": builds system+user conversations, tokenizes via
-        apply_chat_template (LFM, Qwen).
-    collate_style="paligemma": uses the PaliGemma processor directly.
+    If `action_token_id` is given, an <action> token is appended at the end of
+    each sequence's real content (before padding). Pass None when the head
+    doesn't need one (e.g. flow matching, which cross-attends to the full
+    fusion-layer hidden).
     """
     tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-    action_token_id = tok.convert_tokens_to_ids(ACTION_TOKEN)
 
-    def _tokenize_chat_template(batch):
+    def tokenize(batch):
         conversations = []
         for sample in batch:
             conversations.append([
@@ -198,22 +197,10 @@ def make_calvin_collate_fn(processor, system_prompt: str, max_length: int = 512,
             max_length=max_length,
         )
 
-    def _tokenize_paligemma(batch):
-        texts = [f"<image>{s['instruction']}\n" for s in batch]
-        return processor(
-            text=texts,
-            images=[s["image"] for s in batch],
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=max_length,
-        )
-
-    tokenize = _tokenize_chat_template if collate_style == "chat_template" else _tokenize_paligemma
-
     def collate(batch):
         vlm_inputs = tokenize(batch)
-        _insert_token(vlm_inputs, action_token_id, tok.pad_token_id)
+        if action_token_id is not None:
+            _insert_token(vlm_inputs, action_token_id, tok.pad_token_id)
         vlm_inputs["gt_actions"] = torch.stack([s["action_chunk"] for s in batch])
         vlm_inputs["action_mask"] = torch.stack([s["action_mask"] for s in batch])
         return vlm_inputs

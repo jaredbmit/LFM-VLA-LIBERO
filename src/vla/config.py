@@ -22,13 +22,31 @@ NORM_MIN = -0.65
 NORM_MAX = 0.65
 
 
+# Freeze-group registry: dotted module paths under `vla.vlm`
+LFM_GROUPS = {
+    "vision": ("model.vision_tower",),
+    "connector": ("model.multi_modal_projector",),
+    "language": ("model.language_model", "lm_head"),
+}
+QWEN_VL_GROUPS = {
+    "vision": ("model.visual",),
+    "connector": (),
+    "language": ("model.language_model", "lm_head"),
+}
+SMOLVLM_GROUPS = {
+    "vision": ("model.vision_model",),
+    "connector": ("model.connector",),
+    "language": ("model.text_model", "lm_head"),
+}
+
+
 @dataclass
 class ModelSpec:
     model_id: str
     hidden_dim: int
     model_kwargs: dict
     processor_kwargs: dict
-    collate_style: str  # "chat_template" | "paligemma"
+    freeze_groups: dict
     max_length: int = MAX_LENGTH
     default_batch_size: int = 128  # models >= 3B use 64
     default_grad_steps: int = 1   # models >= 3B use 2
@@ -40,7 +58,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         hidden_dim=2048,
         model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={},
-        collate_style="chat_template",
+        freeze_groups=LFM_GROUPS,
         default_batch_size=64,
         default_grad_steps=2,
     ),
@@ -49,56 +67,56 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         hidden_dim=2048,
         model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={},
-        collate_style="chat_template",
+        freeze_groups=LFM_GROUPS,
     ),
     "LFM2-VL-450M": ModelSpec(
         model_id="LiquidAI/LFM2-VL-450M",
         hidden_dim=1024,
         model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={},
-        collate_style="chat_template",
+        freeze_groups=LFM_GROUPS,
     ),
     "LFM2.5-VL-1.6B": ModelSpec(
         model_id="/home/schmidt/ssci-jaredb/scratch_ssci-rus/jaredb/models/LFM2.5-VL-1.6B",
         hidden_dim=2048,
         model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={},
-        collate_style="chat_template",
+        freeze_groups=LFM_GROUPS,
     ),
     "LFM2.5-VL-450M": ModelSpec(
         model_id="/home/schmidt/ssci-jaredb/scratch_ssci-rus/jaredb/models/LFM2.5-VL-450M",
         hidden_dim=1024,
         model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={},
-        collate_style="chat_template",
+        freeze_groups=LFM_GROUPS,
     ),
     "LFM2.5-VL-450M-Grounding-v1": ModelSpec(
         model_id="/home/schmidt/ssci-jaredb/scratch_ssci-rus/jaredb/models/LFM2.5-VL-450M-Grounding-v1",
         hidden_dim=1024,
         model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={},
-        collate_style="chat_template",
+        freeze_groups=LFM_GROUPS,
     ),
     "LFM2.5-VL-450M-Grounding-v2": ModelSpec(
         model_id="/home/schmidt/ssci-jaredb/scratch_ssci-rus/jaredb/models/LFM2.5-VL-450M-Grounding-v2",
         hidden_dim=1024,
         model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={},
-        collate_style="chat_template",
+        freeze_groups=LFM_GROUPS,
     ),
     "LFM2.5-VL-450M-Grounding-v3": ModelSpec(
         model_id="/home/schmidt/ssci-jaredb/scratch_ssci-rus/jaredb/models/LFM2.5-VL-450M-Grounding-v3",
         hidden_dim=1024,
         model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={},
-        collate_style="chat_template",
+        freeze_groups=LFM_GROUPS,
     ),
     "Qwen2.5-VL-3B-Instruct": ModelSpec(
         model_id="Qwen/Qwen2.5-VL-3B-Instruct",
         hidden_dim=2048,
         model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={},
-        collate_style="chat_template",
+        freeze_groups=QWEN_VL_GROUPS,
         default_batch_size=64,
         default_grad_steps=2,
     ),
@@ -107,25 +125,16 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         hidden_dim=2048,
         model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={},
-        collate_style="chat_template",
+        freeze_groups=QWEN_VL_GROUPS,
     ),
     "Qwen3-VL-4B-Instruct": ModelSpec(
         model_id="Qwen/Qwen3-VL-4B-Instruct",
         hidden_dim=2560,
         model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={},
-        collate_style="chat_template",
+        freeze_groups=QWEN_VL_GROUPS,
         default_batch_size=64,
         default_grad_steps=2,
-    ),
-    "paligemma2-3b-mix-224": ModelSpec(
-        model_id="google/paligemma2-3b-mix-224",
-        hidden_dim=2304,
-        model_kwargs={"dtype": torch.bfloat16},
-        processor_kwargs={},
-        collate_style="paligemma",
-        default_batch_size=32,
-        default_grad_steps=4,
     ),
     # Base is 2B parameters
     "SmolVLM-Instruct": ModelSpec(
@@ -133,34 +142,20 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         hidden_dim=2048,
         model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={"size": {"longest_edge": 256}},
-        collate_style="chat_template",
+        freeze_groups=SMOLVLM_GROUPS,
     ),
     "SmolVLM-500M-Instruct": ModelSpec(
         model_id="HuggingFaceTB/SmolVLM-500M-Instruct",
         hidden_dim=960,
         model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={"size": {"longest_edge": 256}},
-        collate_style="chat_template",
+        freeze_groups=SMOLVLM_GROUPS,
     ),
     "SmolVLM-256M-Instruct": ModelSpec(
         model_id="HuggingFaceTB/SmolVLM-256M-Instruct",
         hidden_dim=576,
         model_kwargs={"dtype": torch.bfloat16},
         processor_kwargs={"size": {"longest_edge": 256}},
-        collate_style="chat_template",
+        freeze_groups=SMOLVLM_GROUPS,
     ),
 }
-
-
-"""
-Image token usage by model (tested in experiments/inspect_tokenized_sequences.py)
-LFM2-VL-3B: 64
-LFM2-VL-1.6B: 64
-Qwen3-VL-2B-Instruct: 64
-Qwen3-VL-4B-Instruct: 64
-Qwen2.5-VL-3B-Instruct: 49 
-paligemma2-3b-mix-224: 256
-SmolVLM-Instruct: 81
-SmolVLM-500M-Instruct: 64
-SmolVLM-256M-Instruct: 64
-"""
